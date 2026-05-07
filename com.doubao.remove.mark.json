@@ -1,0 +1,7 @@
+{
+  "name": "com.doubao.remove.mark",
+  "description": "豆包去水印 - Native Messaging Host",
+  "path": "/Users/mars/Library/Application Support/DoubaoNativeHost/native_host.py",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://diijpgapmlngkmnfolmehconegnpbihg/"]
+}

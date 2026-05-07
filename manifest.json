@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "豆包去水印",
+  "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAscUyL9GAqwrzPDE9/gcuYhuPw/KehOfTJc5W+7o0De1g4wBCQy2G17OEN3t4LcPnv6j/aNk6L3P5xOT+qYPpP2V+0oT6TCswWPbe0CZgETrGQsJ/N4lZ78K0n+1qfNdUNqDyPH3UWudoN+nGsOAmN1oFnRbWCFhH1PEd/Luc8+h5/pxGpGkSDoddj73LOEAAYFVJJX7naq9Y8iYbgoLt4gWqmK0QfueVa9rnmVX5ZZkPrt59FxofPIdBzuJEKnL+sPhUJghDzHSidz2Mf1TH/g+/V7DdaLlod53YtA3Df20bu0bANQcNThdPey5r9kFYNgWYf1UxPSH9Yq3F650RiQIDAQAB",
+  "description": "豆包AI生图无水印下载，自动替换带水印图片为原始无水印图片",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "downloads",
+    "contextMenus",
+    "storage",
+    "scripting",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "https://*.doubao.com/*",
+    "https://*.byteimg.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.doubao.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    }
+  }
+}

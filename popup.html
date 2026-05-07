@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>豆包去水印</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 380px;
+      max-height: 560px;
+      overflow-y: auto;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+      background: #f7f8fa;
+      color: #333;
+    }
+    body::-webkit-scrollbar { width: 4px; }
+    body::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+
+    .header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      padding: 14px 18px;
+      color: #fff;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .header h1 { font-size: 16px; font-weight: 600; margin-bottom: 2px; }
+    .header p { font-size: 11px; opacity: 0.85; }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      background: #fff;
+      border-bottom: 1px solid #eee;
+    }
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+    }
+    #hookStatusText.clickable {
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 24px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: rgba(255, 77, 79, 0.1);
+      transition: all .2s;
+    }
+    #hookStatusText.clickable:hover {
+      background: rgba(255, 77, 79, 0.22);
+    }
+    .status-dot.inactive.pulse {
+      animation: dotPulse 1.4s ease-in-out infinite;
+    }
+    @keyframes dotPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 77, 79, 0.5); }
+      50% { box-shadow: 0 0 0 5px rgba(255, 77, 79, 0); }
+    }
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .status-dot.active { background: #52c41a; box-shadow: 0 0 4px rgba(82,196,26,.5); }
+    .status-dot.inactive { background: #ff4d4f; }
+
+    .section {
+      background: #fff;
+      margin: 8px 10px;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,.05);
+    }
+    .section-title {
+      font-size: 12px;
+      color: #999;
+      padding: 10px 16px 4px;
+      font-weight: 500;
+    }
+
+    /* ── 下载目录 ── */
+    .dir-wrap {
+      padding: 10px 16px;
+    }
+    .dir-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .dir-display {
+      flex: 1;
+      font-size: 12px;
+      color: #555;
+      background: #f5f5f5;
+      border: 1px solid #e8e8e8;
+      border-radius: 6px;
+      padding: 7px 10px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      cursor: text;
+      outline: none;
+      min-height: 30px;
+    }
+    .dir-display:focus {
+      border-color: #667eea;
+      background: #fff;
+      cursor: text;
+    }
+    .dir-display:hover:not(:focus) {
+      border-color: #ccc;
+    }
+    .dir-display.default { color: #999; }
+    .dir-btn {
+      font-size: 11px;
+      background: #667eea;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 7px 14px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background .2s;
+    }
+    .dir-btn:hover { background: #5a6fd6; }
+    .dir-hint {
+      font-size: 10px;
+      color: #bbb;
+      margin-top: 5px;
+    }
+    .dir-fullpath {
+      font-size: 10px;
+      color: #999;
+      margin-top: 4px;
+      font-family: "SF Mono", "Monaco", "Menlo", "Consolas", monospace;
+      word-break: break-all;
+      line-height: 1.4;
+      padding: 0 2px;
+      max-height: 36px;
+      overflow-y: auto;
+    }
+    .dir-fullpath::-webkit-scrollbar { width: 3px; }
+    .dir-fullpath::-webkit-scrollbar-thumb { background: #ddd; border-radius: 2px; }
+    .dir-actions {
+      margin-top: 6px;
+    }
+    .dir-open-btn {
+      font-size: 11px;
+      color: #667eea;
+      background: none;
+      border: 1px solid #667eea;
+      border-radius: 6px;
+      padding: 4px 12px;
+      cursor: pointer;
+      transition: all .2s;
+      white-space: nowrap;
+    }
+    .dir-open-btn:hover {
+      background: #667eea;
+      color: #fff;
+    }
+    .dir-open-btn:disabled {
+      color: #ccc;
+      border-color: #ccc;
+      cursor: not-allowed;
+    }
+    .dir-open-btn:disabled:hover {
+      background: none;
+      color: #ccc;
+    }
+    .dir-open-btn[style*="e74c3c"]:hover {
+      background: #e74c3c;
+      color: #fff;
+    }
+
+    /* ── 图片网格 ── */
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+      padding: 10px 12px;
+      user-select: none;
+      -webkit-user-select: none;
+      cursor: crosshair;
+    }
+    .image-card {
+      position: relative;
+      aspect-ratio: 1;
+      border-radius: 8px;
+      overflow: hidden;
+      cursor: pointer;
+      border: 2px solid transparent;
+      transition: border-color .2s, transform .15s;
+    }
+    .image-card:hover { transform: scale(1.03); }
+    .image-card.selected { border-color: #667eea; }
+    .image-card img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .image-card .check-mark {
+      position: absolute;
+      top: 4px; right: 4px;
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: #667eea;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      opacity: 0;
+      transform: scale(.6);
+      transition: opacity .2s, transform .2s;
+    }
+    .image-card.selected .check-mark {
+      opacity: 1;
+      transform: scale(1);
+    }
+    .image-card .quality-badge {
+      position: absolute;
+      bottom: 4px; left: 4px;
+      background: rgba(0,0,0,.55);
+      color: #fff;
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      pointer-events: none;
+    }
+
+    .action-bar {
+      position: sticky;
+      bottom: 0;
+      background: #fff;
+      border-top: 1px solid #eee;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      z-index: 10;
+    }
+    .select-all-btn {
+      font-size: 12px;
+      color: #667eea;
+      background: none;
+      border: none;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .select-all-btn:hover { text-decoration: underline; }
+    .action-bar .spacer { flex: 1; }
+    .download-btn {
+      font-size: 13px;
+      font-weight: 500;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 18px;
+      cursor: pointer;
+      transition: background .2s;
+    }
+    .download-btn.primary {
+      background: #667eea;
+      color: #fff;
+    }
+    .download-btn.primary:hover { background: #5a6fd6; }
+    .download-btn.primary:disabled {
+      background: #b3b3b3;
+      cursor: not-allowed;
+    }
+    .selected-count {
+      font-size: 12px;
+      color: #999;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 30px 20px;
+      color: #bfbfbf;
+    }
+    .empty-state .icon { font-size: 40px; margin-bottom: 8px; }
+    .empty-state p { font-size: 13px; }
+
+    .tip {
+      padding: 6px 16px;
+      background: #fffbe6;
+      font-size: 11px;
+      color: #ad6800;
+      line-height: 1.5;
+    }
+
+    /* ── 框选矩形 ── */
+    .selection-rect {
+      position: absolute;
+      border: 2px dashed #667eea;
+      background: rgba(102, 126, 234, 0.15);
+      pointer-events: none;
+      z-index: 21;
+      display: none;
+    }
+
+    .footer {
+      text-align: center;
+      padding: 8px;
+      font-size: 10px;
+      color: #ccc;
+    }
+
+    /* ── Toast 通知 ── */
+    .popup-toast {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 16px;
+      transform: translateY(-100%);
+      transition: transform .3s cubic-bezier(.4, 0, .2, 1);
+      font-size: 13px;
+      font-weight: 500;
+      gap: 8px;
+    }
+    .popup-toast.show {
+      transform: translateY(0);
+    }
+    .popup-toast.success {
+      background: linear-gradient(135deg, #52c41a, #73d13d);
+      color: #fff;
+    }
+    .popup-toast.error {
+      background: linear-gradient(135deg, #ff4d4f, #ff7875);
+      color: #fff;
+    }
+    .popup-toast.info {
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      color: #fff;
+    }
+    .popup-toast .toast-icon {
+      font-size: 16px;
+    }
+    .popup-toast .toast-text {
+      flex: 1;
+    }
+    .popup-toast .toast-progress {
+      font-size: 11px;
+      opacity: 0.85;
+    }
+
+    /* ── 下载进度条 ── */
+    .download-progress {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      z-index: 101;
+      background: rgba(102, 126, 234, 0.15);
+      display: none;
+    }
+    .download-progress.active {
+      display: block;
+    }
+    .download-progress .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #667eea, #764ba2);
+      border-radius: 0 2px 2px 0;
+      transition: width .3s ease;
+      width: 0%;
+    }
+  </style>
+</head>
+<body>
+  <!-- 下载进度条 -->
+  <div class="download-progress" id="downloadProgress">
+    <div class="progress-fill" id="progressFill"></div>
+  </div>
+  <!-- Toast 通知 -->
+  <div class="popup-toast" id="popupToast">
+    <span class="toast-icon" id="toastIcon"></span>
+    <span class="toast-text" id="toastText"></span>
+    <span class="toast-progress" id="toastProgress"></span>
+  </div>
+
+  <div class="header">
+    <h1>🎨 豆包去水印</h1>
+    <p>自动提取无水印原图，一键批量下载</p>
+  </div>
+
+  <div class="status-bar">
+    <div class="status-item">
+      <span class="status-dot inactive" id="hookStatus"></span>
+      <span id="hookStatusText">检测中...</span>
+    </div>
+  </div>
+
+  <!-- 下载目录 -->
+  <div class="section">
+    <div class="section-title">📁 下载目录</div>
+    <div class="dir-wrap">
+      <div class="dir-row">
+        <div class="dir-display default" id="dirDisplay">豆包无水印图片（默认）</div>
+        <button class="dir-btn" id="changeDirBtn">选择目录</button>
+      </div>
+      <div class="dir-fullpath" id="dirFullPath"></div>
+      <div class="dir-actions">
+        <button class="dir-open-btn" id="openDirBtn" title="在文件管理器中打开下载目录">
+          📂 打开下载目录
+        </button>
+      <div class="dir-hint">点击"选择目录"可选取任意文件夹直接写入；点击路径可手动输入子目录名（在默认下载目录下创建）</div>
+    </div>
+  </div>
+
+  <!-- 图片选择区 -->
+  <div class="section">
+    <div class="section-title">🖼️ 无水印原图（点击选择，框选多选）</div>
+    <div style="position:relative;">
+      <div class="selection-rect" id="selectionRect"></div>
+      <div class="image-grid" id="imageGrid"></div>
+    </div>
+    <div class="empty-state" id="emptyState">
+      <div class="icon">📭</div>
+      <p>未检测到豆包AI生成的图片<br>请在豆包对话页面生成图片后刷新</p>
+    </div>
+  </div>
+
+  <div class="tip">
+    💡 在豆包AI对话页面右键图片，可直接"下载原图（无水印）"
+  </div>
+
+  <!-- 底部操作栏 -->
+  <div class="action-bar">
+    <button class="select-all-btn" id="selectAllBtn">全选</button>
+    <button class="select-all-btn" id="deselectAllBtn">取消全选</button>
+    <span class="selected-count" id="selectedCount">已选 0 张</span>
+    <span class="spacer"></span>
+    <button class="download-btn primary" id="downloadBtn" disabled>下载选中</button>
+  </div>
+
+  <div class="footer">v1.1.0</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
