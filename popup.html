@@ -81,6 +81,40 @@
       color: #999;
       padding: 10px 16px 4px;
       font-weight: 500;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* ── 排序切换 ── */
+    .sort-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: #667eea;
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
+      background: rgba(102, 126, 234, 0.08);
+      border: 1px solid rgba(102, 126, 234, 0.25);
+      border-radius: 4px;
+      padding: 2px 8px;
+      transition: all .2s;
+    }
+    .sort-toggle:hover {
+      background: rgba(102, 126, 234, 0.18);
+      border-color: rgba(102, 126, 234, 0.45);
+    }
+    .sort-toggle .sort-arrow {
+      font-size: 10px;
+      transition: transform .2s;
+    }
+    .sort-toggle.desc .sort-arrow {
+      transform: rotate(180deg);
+    }
+    .sort-toggle.asc .sort-arrow {
+      transform: rotate(0deg);
     }
 
     /* ── 下载目录 ── */
@@ -236,15 +270,12 @@
     }
 
     .action-bar {
-      position: sticky;
-      bottom: 0;
       background: #fff;
       border-top: 1px solid #eee;
       padding: 10px 16px;
       display: flex;
       align-items: center;
       gap: 8px;
-      z-index: 10;
     }
     .select-all-btn {
       font-size: 12px;
@@ -257,13 +288,15 @@
     .select-all-btn:hover { text-decoration: underline; }
     .action-bar .spacer { flex: 1; }
     .download-btn {
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 500;
       border: none;
-      border-radius: 8px;
-      padding: 8px 18px;
+      border-radius: 6px;
+      padding: 7px 14px;
       cursor: pointer;
       transition: background .2s;
+      line-height: 1.4;
+      white-space: nowrap;
     }
     .download-btn.primary {
       background: #667eea;
@@ -419,9 +452,22 @@
     </div>
   </div>
 
+  <div class="tip">
+    💡 在豆包AI对话页面右键图片，可直接"下载原图（无水印）"
+  </div>
+
+  <!-- 操作栏（已上移到图片区上方，方便快速操作） -->
+  <div class="action-bar">
+    <button class="select-all-btn" id="selectAllBtn">全选</button>
+    <button class="select-all-btn" id="deselectAllBtn">取消全选</button>
+    <span class="selected-count" id="selectedCount">已选 0 张</span>
+    <span class="spacer"></span>
+    <button class="download-btn primary" id="downloadBtn" disabled>下载选中</button>
+  </div>
+
   <!-- 图片选择区 -->
   <div class="section">
-    <div class="section-title">🖼️ 无水印原图（点击选择，框选多选）</div>
+    <div class="section-title">🖼️ 无水印原图（点击选择，框选多选）<span class="sort-toggle desc" id="sortToggle"><span id="sortLabel">倒序</span><span class="sort-arrow">▼</span></span></div>
     <div style="position:relative;">
       <div class="selection-rect" id="selectionRect"></div>
       <div class="image-grid" id="imageGrid"></div>
@@ -430,19 +476,6 @@
       <div class="icon">📭</div>
       <p>未检测到豆包AI生成的图片<br>请在豆包对话页面生成图片后刷新</p>
     </div>
-  </div>
-
-  <div class="tip">
-    💡 在豆包AI对话页面右键图片，可直接"下载原图（无水印）"
-  </div>
-
-  <!-- 底部操作栏 -->
-  <div class="action-bar">
-    <button class="select-all-btn" id="selectAllBtn">全选</button>
-    <button class="select-all-btn" id="deselectAllBtn">取消全选</button>
-    <span class="selected-count" id="selectedCount">已选 0 张</span>
-    <span class="spacer"></span>
-    <button class="download-btn primary" id="downloadBtn" disabled>下载选中</button>
   </div>
 
   <div class="footer">v1.1.0</div>

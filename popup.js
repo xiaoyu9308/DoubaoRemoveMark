@@ -7,6 +7,7 @@
 // ── 全局状态 ──────────────────────────────────────────────────────────────────
 let imageList = [];         // 去重后的图片列表 [{ url, previewUrl, width, height, quality }]
 let selectedSet = new Set();
+let sortOrder = 'desc';     // 排序顺序：'desc' 倒序（最新在前），'asc' 正序（最早在前）
 const DEFAULT_DOWNLOAD_DIR = '豆包无水印图片';
 
 // ── DOM 引用 ──────────────────────────────────────────────────────────────────
@@ -22,6 +23,8 @@ const $dirDisplay = document.getElementById('dirDisplay');
 const $changeDirBtn = document.getElementById('changeDirBtn');
 const $dirFullPath = document.getElementById('dirFullPath');
 const $openDirBtn = document.getElementById('openDirBtn');
+const $sortToggle = document.getElementById('sortToggle');
+const $sortLabel = document.getElementById('sortLabel');
 const $popupToast = document.getElementById('popupToast');
 const $toastIcon = document.getElementById('toastIcon');
 const $toastText = document.getElementById('toastText');
@@ -87,17 +90,18 @@ function hideDownloadProgress() {
 
 // ── 初始化 ──────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
-  // ── 下载目录管理 ──────────────────────────────────────────────────────────
+  // ── 下载目录管理（方案 B：完全走 native host）──────────────────────────────
   // 核心思路：
-  // - 使用 File System Access API (showDirectoryPicker) 获取目录句柄，直接写入文件
-  // - 保存 dirHandle 到 IndexedDB（chrome.storage 无法存 Handle）
-  // - 如果没有 dirHandle，回退到 chrome.downloads（相对路径，在默认下载目录下创建子目录）
-  // - 手动输入的路径名作为相对子目录名使用
+  // - 「选择目录」：调 native host → AppleScript 弹原生 choose folder → 返回绝对路径
+  // - 「下载图片」：popup 拉图片 base64 → 通过 background → native host 直接写到绝对路径
+  // - 「打开目录」：调 native host → open <绝对路径>
+  // - 不再使用 showDirectoryPicker / IndexedDB dirHandle / chrome.downloads.download
+  //   也不再产生任何探针文件，路径来源唯一：storage.downloadDirFullPath
 
-  let currentDirHandle = null;   // File System Access API 的目录句柄
-  let currentDirName = DEFAULT_DOWNLOAD_DIR;  // 显示用的目录名
+  let currentDirFullPath = '';                // 选定目录的绝对路径（唯一权威来源）
+  let currentDirName = DEFAULT_DOWNLOAD_DIR;  // 显示用的目录叶子名
 
-  // IndexedDB 操作：保存/读取 FileSystemDirectoryHandle
+  // 保留 IndexedDB 操作（清理旧版本残留的 dirHandle）
   async function saveDirHandle(handle) {
     return new Promise((resolve, reject) => {
       const request = indexedDB.open('DoubaoRemoveMarkDB', 1);
@@ -184,20 +188,30 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   // 加载已保存的目录设置
-  const stored = await chrome.storage.local.get('downloadDir');
-  currentDirName = stored.downloadDir || DEFAULT_DOWNLOAD_DIR;
-  updateDirDisplay(currentDirName);
-
-  // 尝试恢复 dirHandle
-  // 注意：不在初始化时验证权限，因为 popup 打开时没有用户交互，
-  // requestPermission 会失败。保留 dirHandle，等下载时再验证权限。
-  const savedHandle = await loadDirHandle();
-  if (savedHandle) {
-    currentDirHandle = savedHandle;
-    currentDirName = savedHandle.name;
-    await chrome.storage.local.set({ downloadDir: savedHandle.name });
-    updateDirDisplay(savedHandle.name);
+  const stored = await chrome.storage.local.get(['downloadDir', 'downloadDirFullPath']);
+  if (stored.downloadDirFullPath) {
+    currentDirFullPath = stored.downloadDirFullPath;
+    // 从绝对路径推导叶子名作为显示名（如果 storage 里有就用 storage 里的）
+    const lastSep = Math.max(currentDirFullPath.lastIndexOf('/'), currentDirFullPath.lastIndexOf('\\'));
+    const leaf = (lastSep >= 0 && lastSep < currentDirFullPath.length - 1) ? currentDirFullPath.substring(lastSep + 1) : currentDirFullPath;
+    currentDirName = stored.downloadDir || leaf;
+  } else {
+    currentDirName = stored.downloadDir || DEFAULT_DOWNLOAD_DIR;
   }
+  updateDirDisplay(currentDirName);
+  if (currentDirFullPath) {
+    $dirFullPath.textContent = currentDirFullPath;
+  } else {
+    $dirFullPath.textContent = '未设置，点击「选择目录」指定';
+  }
+
+  // 清理旧版本残留的 IndexedDB dirHandle（方案 B 不再使用）
+  try {
+    const stale = await loadDirHandle();
+    if (stale) {
+      await removeDirHandle();
+    }
+  } catch (e) { /* ignore */ }
 
   // 目录显示区可编辑：点击后进入编辑模式，直接输入子目录名
   $dirDisplay.addEventListener('click', () => {
@@ -216,10 +230,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     $dirDisplay.contentEditable = false;
     const val = $dirDisplay.textContent.trim();
     const dirName = val || DEFAULT_DOWNLOAD_DIR;
+    // 方案 B 下，手动编辑显示名仅用于 UI 标签，绝对路径仍由「选择目录」决定
     currentDirName = dirName;
-    // 手动输入时清除 dirHandle（改为相对路径模式）
-    currentDirHandle = null;
-    await removeDirHandle();
     await chrome.storage.local.set({ downloadDir: dirName });
     updateDirDisplay(dirName);
   });
@@ -236,29 +248,56 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  // 选择目录按钮 — 弹出 Mac 原生目录选择器
+  // 选择目录按钮 — 通过 native host 弹出 macOS 原生 choose folder 对话框
   $changeDirBtn.addEventListener('click', async () => {
+    $changeDirBtn.disabled = true;
     try {
-      // File System Access API — 弹出原生目录选择器
-      const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-      // 验证权限
-      const perm = await dirHandle.requestPermission({ mode: 'readwrite' });
-      if (perm !== 'granted') {
-        console.warn('[豆包去水印] 目录写入权限未授予');
+      const result = await chrome.runtime.sendMessage({
+        type: 'CHOOSE_DIRECTORY',
+        defaultLocation: currentDirFullPath || ''
+      });
+      if (!result) {
+        showPopupToast('Native 未响应，请确认已安装 native host', 'error');
         return;
       }
-      currentDirHandle = dirHandle;
-      currentDirName = dirHandle.name;
-      await saveDirHandle(dirHandle);
-      await chrome.storage.local.set({ downloadDir: dirHandle.name });
-      updateDirDisplay(dirHandle.name);
+      if (result.canceled) {
+        return;
+      }
+      if (!result.success || !result.path) {
+        const errMsg = result.error || '未知错误';
+        const isNativeNotReady =
+          /Specified native messaging host not found/i.test(errMsg) ||
+          /Native host has exited/i.test(errMsg) ||
+          /Access to the specified native messaging host is forbidden/i.test(errMsg) ||
+          /Error when communicating with the native messaging host/i.test(errMsg);
+        if (isNativeNotReady) {
+          showPopupToast('Native 未就绪，请先安装 native host', 'error');
+        } else {
+          showPopupToast('选择目录失败: ' + errMsg, 'error');
+        }
+        return;
+      }
+      // 成功：拿到绝对路径，立刻刷新所有状态
+      const absPath = result.path;
+      const lastSep = Math.max(absPath.lastIndexOf('/'), absPath.lastIndexOf('\\'));
+      const leaf = (lastSep >= 0 && lastSep < absPath.length - 1) ? absPath.substring(lastSep + 1) : absPath;
+      currentDirFullPath = absPath;
+      currentDirName = leaf;
+      await chrome.storage.local.set({
+        downloadDir: leaf,
+        downloadDirFullPath: absPath
+      });
+      // 清理旧版本可能存在的字段
+      await chrome.storage.local.remove(['downloadDirRelPath']);
+      // 立即刷新 UI
+      updateDirDisplay(leaf);
+      $dirFullPath.textContent = absPath;
+      $dirFullPath.style.color = '';
+      showPopupToast('目录已设置：' + absPath, 'success');
     } catch (e) {
-      if (e.name === 'AbortError') return; // 用户取消选择
-      console.error('[豆包去水印] 目录选择失败:', e);
-      // 回退：手动输入模式
-      $dirDisplay.textContent = currentDirName;
-      $dirDisplay.contentEditable = true;
-      $dirDisplay.focus();
+      showPopupToast('选择目录失败: ' + (e && e.message ? e.message : e), 'error');
+    } finally {
+      $changeDirBtn.disabled = false;
     }
   });
 
@@ -266,21 +305,49 @@ document.addEventListener('DOMContentLoaded', async () => {
   $openDirBtn.addEventListener('click', async () => {
     $openDirBtn.disabled = true;
     try {
-      const stored = await chrome.storage.local.get(['downloadDirFullPath']);
-      const dirFullPath = stored.downloadDirFullPath;
-      const targetPath = dirFullPath || '/Users/mars/Downloads/Doubao/Download';
+      // 路径来源：只使用 storage 中存储的绝对路径（在「选择目录」时已解析并落库）
+      const s = await chrome.storage.local.get(['downloadDirFullPath']);
+      let targetPath = s.downloadDirFullPath;
+      if (!targetPath) {
+        showPopupToast('请先点击「选择目录」指定下载目录', 'error');
+        return;
+      }
       const result = await chrome.runtime.sendMessage({ type: 'OPEN_DIRECTORY', path: targetPath });
       if (result && result.success) {
         // 成功
       } else {
-        const extId = chrome.runtime.id;
-        const installCmd = `bash /Users/mars/Documents/WorkSpace/CodeBuddy/Chrome/DoubaoRemoveMark/install_native_host.sh ${extId}`;
-        try { await navigator.clipboard.writeText(installCmd); } catch(e) {}
-        showPopupToast('❌ Native未就绪，安装命令已复制到剪贴板', 'error');
-        console.log('[豆包去水印] 请在终端运行:', installCmd);
+        // 区分错误类型：根据具体的 error 信息判断
+        const errMsg = (result && result.error) ? String(result.error) : '';
+        const isNativeNotReady =
+          !result ||                                                        // background 没返回（消息通道异常）
+          /Specified native messaging host not found/i.test(errMsg) ||      // manifest 未注册
+          /Native host has exited/i.test(errMsg) ||                         // 脚本启动失败
+          /Access to the specified native messaging host is forbidden/i.test(errMsg) || // allowed_origins 不匹配
+          /Error when communicating with the native messaging host/i.test(errMsg);
+        const isDirNotExist = /does not exist/i.test(errMsg) || /No such file/i.test(errMsg);
+
+        if (isNativeNotReady) {
+          // 真正的 Native 未就绪：提示安装方法
+          const extId = chrome.runtime.id;
+          // 不硬编码脚本路径（因每个用户安装位置不同），提示用户手动定位脚本
+          const installHint = `bash <插件目录>/install_native_host.sh ${extId}`;
+          try { await navigator.clipboard.writeText(installHint); } catch(e) {}
+          showPopupToast('❌ Native未就绪，请在终端运行安装脚本（命令已复制，需替换<插件目录>为实际路径）', 'error');
+          console.log('[豆包去水印] 请在终端运行: bash <插件目录>/install_native_host.sh', extId);
+        } else if (isDirNotExist) {
+          // 目录不存在：自动清除 storage 中的脏路径，刷新显示，引导用户重新选择
+          await chrome.storage.local.remove(['downloadDirFullPath', 'downloadDirRelPath']);
+          await updateFullPathDisplay();
+          showPopupToast(`❌ 目录不存在：已自动重置，请点击"选择目录"重新指定`, 'error');
+          console.warn('[豆包去水印] 目录不存在，已清除 storage 中的脏路径:', targetPath);
+        } else {
+          // 其他未知错误：显示原始 error 信息，便于排查
+          showPopupToast(`❌ 打开目录失败: ${errMsg || '未知错误'}`, 'error');
+          console.warn('[豆包去水印] 打开目录失败:', errMsg);
+        }
       }
     } catch (e) {
-      showPopupToast('打开下载目录失败', 'error');
+      showPopupToast('打开下载目录失败: ' + (e && e.message ? e.message : e), 'error');
     } finally {
       setTimeout(() => { $openDirBtn.disabled = false; }, 500);
     }
@@ -315,6 +382,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     console.error('初始化失败:', e);
   }
 
+  // ── 排序切换 ───────────────────────────────────────────────────────────────────────
+  $sortToggle.addEventListener('click', () => {
+    sortOrder = sortOrder === 'desc' ? 'asc' : 'desc';
+    $sortToggle.className = 'sort-toggle ' + sortOrder;
+    $sortLabel.textContent = sortOrder === 'desc' ? '倒序' : '正序';
+    renderImageGrid();
+  });
+
   // 全选 / 取消全选
   $selectAllBtn.addEventListener('click', () => {
     imageList.forEach((_, i) => selectedSet.add(i));
@@ -330,6 +405,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     const selected = Array.from(selectedSet).map(i => imageList[i]).filter(Boolean);
     if (selected.length === 0) return;
 
+    // 方案 B：必须先选目录拿到绝对路径，否则没法下载
+    const s = await chrome.storage.local.get(['downloadDirFullPath']);
+    const targetDir = s.downloadDirFullPath;
+    if (!targetDir) {
+      showPopupToast('请先点击「选择目录」指定下载目录', 'error');
+      return;
+    }
+
     $downloadBtn.disabled = true;
     $downloadBtn.textContent = '下载中...';
 
@@ -340,125 +423,63 @@ document.addEventListener('DOMContentLoaded', async () => {
     let successCount = 0;
     let failCount = 0;
 
-    // 预验证 dirHandle 权限（只在下载开始时验证一次）
-    let useFileSystemAPI = !!currentDirHandle;
-    let lastDownloadId = null;  // 记录最后一个下载ID，用于"打开目录"功能
-    if (useFileSystemAPI) {
-      try {
-        const perm = await currentDirHandle.queryPermission({ mode: 'readwrite' });
-        if (perm !== 'granted') {
-          // 用户刚点击了下载按钮，此时 requestPermission 可以触发权限弹窗
-          const req = await currentDirHandle.requestPermission({ mode: 'readwrite' });
-          if (req !== 'granted') {
-            console.warn('[豆包去水印] 目录写入权限未授予，回退到 chrome.downloads');
-            useFileSystemAPI = false;
-            showPopupToast('目录权限未授予，将下载到默认目录', 'info');
-            await new Promise(r => setTimeout(r, 1500));
-          }
-        }
-      } catch (e) {
-        // handle 可能已失效（如目录被删除/移动），清除并提示用户重新选择
-        console.warn('[豆包去水印] 目录权限验证失败，回退到 chrome.downloads:', e);
-        useFileSystemAPI = false;
-        currentDirHandle = null;
-        await removeDirHandle();
-        showPopupToast('目录已失效，将下载到默认目录，请重新选择目录', 'info');
-        await new Promise(r => setTimeout(r, 1500));
-      }
-    }
-
     for (let i = 0; i < selected.length; i++) {
       try {
         const url = selected[i].url;
         const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 17);
         const ext = url.match(/\.(png|jpe?g|webp)/)?.[1] || 'png';
-        const filename = 'doubao_' + timestamp + '.' + ext;
+        const filename = 'doubao_' + timestamp + '_' + (i + 1) + '.' + ext;
 
-        if (useFileSystemAPI) {
-          // 方式1：使用 File System Access API 直接写入选定目录
-          try {
-            // 通过 background script 获取图片数据（避免 CORS 问题）
-            const imageBlob = await new Promise((resolve, reject) => {
-              chrome.runtime.sendMessage(
-                { type: 'FETCH_IMAGE', url: url },
-                (response) => {
-                  if (chrome.runtime.lastError) {
-                    reject(new Error(chrome.runtime.lastError.message));
-                    return;
-                  }
-                  if (response && response.success) {
-                    // 将 base64 转为 Blob
-                    const byteString = atob(response.data);
-                    const ab = new ArrayBuffer(byteString.length);
-                    const ia = new Uint8Array(ab);
-                    for (let j = 0; j < byteString.length; j++) {
-                      ia[j] = byteString.charCodeAt(j);
-                    }
-                    resolve(new Blob([ab], { type: response.mimeType || 'image/png' }));
-                  } else {
-                    reject(new Error(response?.error || '获取图片数据失败'));
-                  }
-                }
-              );
-            });
-
-            // 创建文件并写入
-            const fileHandle = await currentDirHandle.getFileHandle(filename, { create: true });
-            const writable = await fileHandle.createWritable();
-            await writable.write(imageBlob);
-            await writable.close();
-
-            successCount++;
-          } catch (fsErr) {
-            // File System Access 失败，回退到 chrome.downloads
-            console.warn('[豆包去水印] File System API 写入第', i + 1, '张失败，回退到 chrome.downloads:', fsErr);
-            try {
-              const fullPath = currentDirName + '/' + filename;
-              lastDownloadId = await chrome.downloads.download({
-                url: url,
-                filename: fullPath,
-                saveAs: false,
-                conflictAction: 'uniquify'
-              });
-              successCount++;
-            } catch (dlErr) {
-              console.error('[豆包去水印] chrome.downloads 也失败:', dlErr);
-              failCount++;
+        // 1) 通过 background 拉图片 base64（避免 CORS）
+        const fetchResp = await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage(
+            { type: 'FETCH_IMAGE', url: url },
+            (response) => {
+              if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+                return;
+              }
+              if (response && response.success) {
+                resolve(response);
+              } else {
+                reject(new Error(response?.error || '获取图片数据失败'));
+              }
             }
-          }
-        } else {
-          // 方式2：使用 chrome.downloads（相对路径，在默认下载目录下创建子目录）
-          const fullPath = currentDirName + '/' + filename;
-          lastDownloadId = await chrome.downloads.download({
-            url: url,
-            filename: fullPath,
-            saveAs: false,
-            conflictAction: 'uniquify'
-          });
+          );
+        });
+
+        // 2) 通过 background → native host 把 base64 写入 targetDir
+        const writeResp = await chrome.runtime.sendMessage({
+          type: 'WRITE_FILE_NATIVE',
+          dir: targetDir,
+          filename: filename,
+          dataBase64: fetchResp.data
+        });
+        if (writeResp && writeResp.success) {
           successCount++;
+        } else {
+          failCount++;
         }
 
         // 更新进度
         const completed = i + 1;
         const percent = Math.round((completed / selected.length) * 100);
         showDownloadProgress(completed, selected.length, percent);
-        showPopupToast('正在下载无水印图片...', 'info', `${completed}/${selected.length}`);
+        const progressTip = failCount > 0
+          ? `${completed}/${selected.length}（失败 ${failCount} 张）`
+          : `${completed}/${selected.length}`;
+        showPopupToast('正在下载无水印图片...', 'info', progressTip);
 
-        // 间隔300ms避免下载太快
+        // 间隔一点点，避免 native host 排队过快
         if (i < selected.length - 1) {
-          await new Promise(r => setTimeout(r, 300));
+          await new Promise(r => setTimeout(r, 80));
         }
       } catch (e) {
-        console.error('[豆包去水印] 下载第', i + 1, '张失败:', e);
         failCount++;
-
-        // 更新进度（失败也要更新）
         const completed = i + 1;
         const percent = Math.round((completed / selected.length) * 100);
         showDownloadProgress(completed, selected.length, percent);
-        if (failCount > 0) {
-          showPopupToast('正在下载无水印图片...', 'info', `${completed}/${selected.length}（失败 ${failCount} 张）`);
-        }
+        showPopupToast('正在下载无水印图片...', 'info', `${completed}/${selected.length}（失败 ${failCount} 张）`);
       }
     }
 
@@ -468,113 +489,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     $downloadBtn.textContent = '下载选中';
     updateSelection();
 
-    // 保存最后的下载ID，用于"打开目录"功能
-    if (lastDownloadId) {
-      await chrome.storage.local.set({ lastDownloadId: lastDownloadId });
-      // 通过下载记录获取完整路径并更新显示
-      try {
-        const downloads = await chrome.downloads.search({ id: lastDownloadId });
-        if (downloads && downloads.length > 0 && downloads[0].filename) {
-          const filePath = downloads[0].filename;
-          const lastSep = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
-          if (lastSep > 0) {
-            const dirPath = filePath.substring(0, lastSep);
-            $dirFullPath.textContent = dirPath;
-            // 计算相对路径（去掉默认下载目录前缀）
-            const relPath = await computeRelPath(dirPath);
-            await chrome.storage.local.set({
-              downloadDirFullPath: dirPath,
-              downloadDirRelPath: relPath
-            });
-          }
-        }
-      } catch (e) {
-        // 静默失败
-      }
-    } else if (useFileSystemAPI && successCount > 0) {
-      // File System API 模式：需要通过 chrome.downloads 下载一个标记文件来获取 downloadId
-      // 以便"打开目录"功能可以调用 chrome.downloads.show() 在 Finder 中定位
-      try {
-        // 使用 downloadDirRelPath（如果有）而非 currentDirName，确保标记文件下载到正确子目录
-        const storedRelPath = await chrome.storage.local.get('downloadDirRelPath');
-        const markerRelPath = (storedRelPath.downloadDirRelPath || currentDirName) + '/.doubao_dir_marker';
-        const markerId = await chrome.downloads.download({
-          url: 'data:application/octet-stream;base64,Vg==',
-          filename: markerRelPath,
-          saveAs: false,
-          conflictAction: 'overwrite'
-        });
-        // 等待下载完成
-        await new Promise(resolve => {
-          const listener = (delta) => {
-            if (delta.id === markerId && delta.state && (delta.state.current === 'complete' || delta.state.current === 'interrupted')) {
-              chrome.downloads.onChanged.removeListener(listener);
-              resolve();
-            }
-          };
-          chrome.downloads.onChanged.addListener(listener);
-          setTimeout(resolve, 2000);
-        });
-        // 保存 downloadId，用于"打开目录"功能
-        await chrome.storage.local.set({ lastDownloadId: markerId });
-        lastDownloadId = markerId;
-        // 获取完整路径
-        const markerDownloads = await chrome.downloads.search({ id: markerId });
-        if (markerDownloads && markerDownloads.length > 0 && markerDownloads[0].filename) {
-          const filePath = markerDownloads[0].filename;
-          const lastSep = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
-          if (lastSep > 0) {
-            const dirPath = filePath.substring(0, lastSep);
-            $dirFullPath.textContent = dirPath;
-            // 计算相对路径
-            const relPath = await computeRelPath(dirPath);
-            await chrome.storage.local.set({
-              downloadDirFullPath: dirPath,
-              downloadDirRelPath: relPath
-            });
-          }
-        }
-        // 注意：保留 .doubao_dir_marker 标记文件（macOS Finder 默认隐藏 . 开头文件）
-        // 不删除它，确保 chrome.downloads.show() 能可靠在 Finder 中定位该目录
-      } catch (e) {
-        // 标记文件下载失败不影响主流程，尝试推断路径
-        try {
-          const downloads = await chrome.downloads.search({ limit: 1, orderBy: ['-startTime'] });
-          if (downloads && downloads.length > 0 && downloads[0].filename) {
-            const defaultDir = downloads[0].filename;
-            const lastSep = Math.max(defaultDir.lastIndexOf('/'), defaultDir.lastIndexOf('\\'));
-            if (lastSep > 0) {
-              const basePath = defaultDir.substring(0, lastSep);
-              const fullPath = basePath + '/' + currentDirName;
-              $dirFullPath.textContent = fullPath;
-              await chrome.storage.local.set({
-                downloadDirFullPath: fullPath,
-                downloadDirRelPath: currentDirName
-              });
-            }
-          }
-        } catch (e2) {
-          // 静默失败
-        }
-      }
-    }
-
     // 显示完成 toast
-    if (failCount > 0) {
-      showPopupToast(
-        `下载完成：成功 ${successCount} 张，失败 ${failCount} 张`,
-        'error'
-      );
-    } else if (useFileSystemAPI) {
-      showPopupToast(
-        `✨ 已成功下载 ${successCount} 张图片到「${currentDirName}」`,
-        'success'
-      );
+    if (failCount > 0 && successCount === 0) {
+      showPopupToast(`❌ 下载失败 ${failCount} 张，请确认 native host 已就绪`, 'error');
+    } else if (failCount > 0) {
+      showPopupToast(`下载完成：成功 ${successCount} 张，失败 ${failCount} 张`, 'error');
     } else {
-      showPopupToast(
-        `✨ 已成功下载 ${successCount} 张图片到默认下载目录的「${currentDirName}」文件夹`,
-        'success'
-      );
+      showPopupToast(`✨ 已成功下载 ${successCount} 张图片到「${targetDir}」`, 'success');
     }
 
     // 同时在页面中也显示 toast（如果页面还在）
@@ -585,7 +506,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           type: 'SHOW_TOAST',
           text: failCount > 0
             ? `下载完成：成功 ${successCount} 张，失败 ${failCount} 张`
-            : `已下载 ${successCount} 张无水印图片到 ${currentDirName}`,
+            : `已下载 ${successCount} 张无水印图片到 ${targetDir}`,
           toastType: failCount > 0 ? 'info' : 'success'
         });
       }
@@ -687,6 +608,31 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     }
   });
+
+  // ── 更新目录显示 ──────────────────────────────────────────────────────
+  function updateDirDisplay(dir) {
+    $dirDisplay.textContent = dir;
+    if (dir === DEFAULT_DOWNLOAD_DIR) {
+      $dirDisplay.textContent = dir + '（默认）';
+      $dirDisplay.classList.add('default');
+    } else {
+      $dirDisplay.classList.remove('default');
+    }
+    updateFullPathDisplay();
+  }
+
+  // 更新完整路径显示
+  async function updateFullPathDisplay() {
+    try {
+      // 只使用 storage 中存储的下载目录（在“选择目录”时已解析为绝对路径）。
+      const stored = await chrome.storage.local.get(['downloadDirFullPath']);
+      if (stored.downloadDirFullPath) {
+        $dirFullPath.textContent = stored.downloadDirFullPath;
+      } else {
+        $dirFullPath.textContent = '未设置，点击「选择目录」指定';
+      }
+    } catch (e) { /* ignore */ }
+  }
 });
 
 // ── 图片去重：同一张图只保留最高清版本 ──────────────────────────────────────────
@@ -789,7 +735,7 @@ function deduplicateImages(images) {
   return result;
 }
 
-// ── 渲染图片网格 ──────────────────────────────────────────────────────────────
+// ── 渲染图片网格 ──────────────────────────────────────────────────────────────────────
 function renderImageGrid() {
   $imageGrid.innerHTML = '';
 
@@ -799,7 +745,15 @@ function renderImageGrid() {
   }
   $emptyState.style.display = 'none';
 
-  imageList.forEach((img, idx) => {
+  // 根据 sortOrder 排序：'desc' 倒序（最新在前，即列表末尾的图片排到前面）
+  //                'asc' 正序（最早在前，即列表开头的图片排到前面）
+  const sortedIndices = imageList.map((_, idx) => idx);
+  if (sortOrder === 'desc') {
+    sortedIndices.reverse();
+  }
+
+  sortedIndices.forEach(idx => {
+    const img = imageList[idx];
     const card = document.createElement('div');
     card.className = 'image-card';
     card.dataset.index = idx;
@@ -866,71 +820,6 @@ function setHookStatus(active, text) {
     };
   }
 }
-
-  // 计算目录的相对路径（相对于 Chrome 默认下载目录）
-  async function computeRelPath(dirFullPath) {
-    try {
-      const response = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: 'GET_DOWNLOAD_DIR' }, (res) => {
-          if (chrome.runtime.lastError) resolve(null);
-          else resolve(res);
-        });
-      });
-      if (response && response.success && response.path && dirFullPath.startsWith(response.path + '/')) {
-        return dirFullPath.substring(response.path.length + 1);
-      }
-    } catch (e) { /* ignore */ }
-    // 回退：使用 currentDirName
-    return currentDirName;
-  }
-
-  // ── 更新目录显示 ──────────────────────────────────────────────────────────────
-  function updateDirDisplay(dir) {
-    $dirDisplay.textContent = dir;
-    if (dir === DEFAULT_DOWNLOAD_DIR) {
-      $dirDisplay.textContent = dir + '（默认）';
-      $dirDisplay.classList.add('default');
-    } else {
-      $dirDisplay.classList.remove('default');
-    }
-    // 更新完整路径显示
-    updateFullPathDisplay();
-  }
-
-  // 更新完整路径显示
-  async function updateFullPathDisplay() {
-    try {
-      // 获取默认下载目录的绝对路径
-      const response = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: 'GET_DOWNLOAD_DIR' }, (res) => {
-          if (chrome.runtime.lastError) resolve(null);
-          else resolve(res);
-        });
-      });
-
-      if (response && response.success && response.path) {
-        // 获取保存的相对路径（可能比 currentDirName 更准确）
-        const stored = await chrome.storage.local.get(['downloadDirFullPath', 'downloadDirRelPath']);
-        const relPath = stored.downloadDirRelPath || currentDirName;
-        const fullPath = response.path + '/' + relPath;
-        $dirFullPath.textContent = fullPath;
-        await chrome.storage.local.set({
-          downloadDirFullPath: fullPath,
-          downloadDirRelPath: relPath
-        });
-      } else {
-        // 无法获取默认下载目录，只显示目录名
-        const stored = await chrome.storage.local.get('downloadDirFullPath');
-        if (stored.downloadDirFullPath) {
-          $dirFullPath.textContent = stored.downloadDirFullPath;
-        } else {
-          $dirFullPath.textContent = currentDirName;
-        }
-      }
-    } catch (e) {
-      // 静默失败，不影响主流程
-    }
-  }
 
 // ── HTML转义 ──────────────────────────────────────────────────────────────────
 function escapeHtml(str) {

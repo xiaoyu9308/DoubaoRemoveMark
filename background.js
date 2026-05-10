@@ -252,6 +252,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;
 
+    case 'CHOOSE_DIRECTORY':
+      // 通过 native host 弹出 macOS 原生选择目录对话框，返回绝对路径
+      chooseDirectory(message.defaultLocation)
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+
+    case 'WRITE_FILE_NATIVE':
+      // 通过 native host 把 base64 内容写入指定绝对路径下的文件
+      writeFileNative(message.dir, message.filename, message.dataBase64)
+        .then(result => sendResponse(result))
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+
     case 'TEST_NATIVE_PING':
       // 诊断：测试 Native Messaging 是否可用，返回 Python 环境信息
       testNativePing()
@@ -363,7 +377,33 @@ async function openDirectory(dirPath) {
   return { success: false, error: result?.error || 'Native Messaging 返回失败' };
 }
 
-// ── 诊断：测试 Native Messaging 是否可用 ──────────────────────────────────
+// ── 通过 native host 弹出 macOS 原生选择目录对话框 ─────────
+async function chooseDirectory(defaultLocation) {
+  try {
+    const result = await chrome.runtime.sendNativeMessage(
+      'com.doubao.remove.mark',
+      { command: 'choose_dir', prompt: '请选择下载目录', default_location: defaultLocation || '' }
+    );
+    return result || { success: false, error: 'Native Messaging 无响应' };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// ── 通过 native host 写文件（base64 -> 任意绝对路径）───────────
+async function writeFileNative(dir, filename, dataBase64) {
+  try {
+    const result = await chrome.runtime.sendNativeMessage(
+      'com.doubao.remove.mark',
+      { command: 'write_file', dir: dir, filename: filename, data_base64: dataBase64 }
+    );
+    return result || { success: false, error: 'Native Messaging 无响应' };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// ── 诊断：测试 Native Messaging 是否可用 ──────────────────────
 async function testNativePing() {
   try {
     const result = await chrome.runtime.sendNativeMessage(
