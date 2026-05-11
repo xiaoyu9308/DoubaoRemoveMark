@@ -13,6 +13,7 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
       background: #f7f8fa;
       color: #333;
+      padding-bottom: 52px;
     }
     body::-webkit-scrollbar { width: 4px; }
     body::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
@@ -276,6 +277,13 @@
       display: flex;
       align-items: center;
       gap: 8px;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      width: 380px;
+      z-index: 9;
+      box-shadow: 0 -2px 8px rgba(0,0,0,.08);
     }
     .select-all-btn {
       font-size: 12px;
@@ -456,15 +464,6 @@
     💡 在豆包AI对话页面右键图片，可直接"下载原图（无水印）"
   </div>
 
-  <!-- 操作栏（已上移到图片区上方，方便快速操作） -->
-  <div class="action-bar">
-    <button class="select-all-btn" id="selectAllBtn">全选</button>
-    <button class="select-all-btn" id="deselectAllBtn">取消全选</button>
-    <span class="selected-count" id="selectedCount">已选 0 张</span>
-    <span class="spacer"></span>
-    <button class="download-btn primary" id="downloadBtn" disabled>下载选中</button>
-  </div>
-
   <!-- 图片选择区 -->
   <div class="section">
     <div class="section-title">🖼️ 无水印原图（点击选择，框选多选）<span class="sort-toggle desc" id="sortToggle"><span id="sortLabel">倒序</span><span class="sort-arrow">▼</span></span></div>
@@ -476,6 +475,15 @@
       <div class="icon">📭</div>
       <p>未检测到豆包AI生成的图片<br>请在豆包对话页面生成图片后刷新</p>
     </div>
+  </div>
+
+  <!-- 操作栏（sticky 固定在底部，滚动时始终可见） -->
+  <div class="action-bar">
+    <button class="select-all-btn" id="selectAllBtn">全选</button>
+    <button class="select-all-btn" id="deselectAllBtn">取消全选</button>
+    <span class="selected-count" id="selectedCount">已选 0 张</span>
+    <span class="spacer"></span>
+    <button class="download-btn primary" id="downloadBtn" disabled>下载选中</button>
   </div>
 
   <div class="footer">v1.1.0</div>
