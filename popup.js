@@ -19,7 +19,6 @@ const $imageGrid = document.getElementById('imageGrid');
 const $emptyState = document.getElementById('emptyState');
 const $selectAllBtn = document.getElementById('selectAllBtn');
 const $deselectAllBtn = document.getElementById('deselectAllBtn');
-const $selectedCount = document.getElementById('selectedCount');
 const $downloadBtn = document.getElementById('downloadBtn');
 const $dirDisplay = document.getElementById('dirDisplay');
 const $changeDirBtn = document.getElementById('changeDirBtn');
@@ -798,7 +797,6 @@ function updateSelection() {
   });
 
   const count = selectedSet.size;
-  $selectedCount.textContent = `已选 ${count} 张`;
   $downloadBtn.disabled = count === 0;
   $downloadBtn.textContent = count > 0 ? `下载 ${count} 张` : '下载选中';
 }
