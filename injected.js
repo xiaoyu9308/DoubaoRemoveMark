@@ -38,7 +38,6 @@
       try {
         if (item && item.image) {
           var imgData = {
-            // 优先使用无水印原图
             image_ori_raw_url: (item.image.image_ori_raw && item.image.image_ori_raw.url) || null,
             image_ori_url: (item.image.image_ori && item.image.image_ori.url) || null,
             image_preview_url: (item.image.image_preview && item.image.image_preview.url) || null,
@@ -47,7 +46,7 @@
           images.push(imgData);
         }
       } catch (e) {
-        console.error('[豆包去水印] 提取 creation 项时出错:', e);
+        // 跳过异常项
       }
     }
     return images;
@@ -69,8 +68,6 @@
             allImages = allImages.concat(imgs);
           });
           if (allImages.length > 0) {
-            console.log('[豆包去水印] 提取到', allImages.length, '张图片数据');
-            // 通知 content script（隔离世界之间通过 postMessage 通信）
             window.postMessage({
               type: 'DOUBAO_NOWATERMARK_IMAGES',
               images: allImages
@@ -78,12 +75,10 @@
           }
         }
       } catch (e) {
-        console.error('[豆包去水印] 处理数据时出错:', e);
+        // 处理数据出错，跳过
       }
     }
 
     return jsonData;
   };
-
-  console.log('[豆包去水印] JSON.parse 已在页面主世界中被 Hook');
 })();

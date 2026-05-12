@@ -10,6 +10,8 @@ let selectedSet = new Set();
 let sortOrder = 'desc';     // 排序顺序：'desc' 倒序（最新在前），'asc' 正序（最早在前）
 const DEFAULT_DOWNLOAD_DIR = '豆包无水印图片';
 
+
+
 // ── DOM 引用 ──────────────────────────────────────────────────────────────────
 const $hookStatus = document.getElementById('hookStatus');
 const $hookStatusText = document.getElementById('hookStatusText');
@@ -213,6 +215,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   } catch (e) { /* ignore */ }
 
+  // 清理旧版本残留的已下载记录（已废弃此功能）
+  try {
+    await chrome.storage.local.remove(['downloadedUrls']);
+  } catch (e) { /* ignore */ }
+
   // 目录显示区可编辑：点击后进入编辑模式，直接输入子目录名
   $dirDisplay.addEventListener('click', () => {
     // 先显示纯目录名，方便编辑
@@ -330,20 +337,15 @@ document.addEventListener('DOMContentLoaded', async () => {
           // 真正的 Native 未就绪：提示安装方法
           const extId = chrome.runtime.id;
           // 不硬编码脚本路径（因每个用户安装位置不同），提示用户手动定位脚本
-          const installHint = `bash <插件目录>/install_native_host.sh ${extId}`;
-          try { await navigator.clipboard.writeText(installHint); } catch(e) {}
-          showPopupToast('❌ Native未就绪，请在终端运行安装脚本（命令已复制，需替换<插件目录>为实际路径）', 'error');
-          console.log('[豆包去水印] 请在终端运行: bash <插件目录>/install_native_host.sh', extId);
+          showPopupToast('❌ Native未就绪，请在终端运行安装脚本', 'error');
         } else if (isDirNotExist) {
           // 目录不存在：自动清除 storage 中的脏路径，刷新显示，引导用户重新选择
           await chrome.storage.local.remove(['downloadDirFullPath', 'downloadDirRelPath']);
           await updateFullPathDisplay();
           showPopupToast(`❌ 目录不存在：已自动重置，请点击"选择目录"重新指定`, 'error');
-          console.warn('[豆包去水印] 目录不存在，已清除 storage 中的脏路径:', targetPath);
         } else {
           // 其他未知错误：显示原始 error 信息，便于排查
           showPopupToast(`❌ 打开目录失败: ${errMsg || '未知错误'}`, 'error');
-          console.warn('[豆包去水印] 打开目录失败:', errMsg);
         }
       }
     } catch (e) {
@@ -379,7 +381,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       setHookStatus(false, '非豆包页面');
     }
   } catch (e) {
-    console.error('初始化失败:', e);
+    // 初始化失败，静默
   }
 
   // ── 排序切换 ───────────────────────────────────────────────────────────────────────
@@ -400,7 +402,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateSelection();
   });
 
-  // 批量下载
+  // ── 批量下载 ──
+  // 核心改动：一次性把所有 items 发给 background.js（native host 并行下载）
+  // 通过 connectNative 长连接，native host 每完成一张图片就推送 download_progress 回调
+  // popup 监听 DOWNLOAD_PROGRESS_UPDATE 消息实时刷新进度
+
   $downloadBtn.addEventListener('click', async () => {
     const selected = Array.from(selectedSet).map(i => imageList[i]).filter(Boolean);
     if (selected.length === 0) return;
@@ -416,102 +422,113 @@ document.addEventListener('DOMContentLoaded', async () => {
     $downloadBtn.disabled = true;
     $downloadBtn.textContent = '下载中...';
 
-    // 显示进度条和初始 toast
-    showDownloadProgress(0, selected.length, 0);
-    showPopupToast('正在下载无水印图片...', 'info', `0/${selected.length}`);
+    const total = selected.length;
 
-    let successCount = 0;
-    let failCount = 0;
+    // 构建下载 items
+    const downloadItems = selected.map((img, i) => {
+      const url = img.url;
+      const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const ext = url.match(/\.(png|jpe?g|webp)/)?.[1] || 'png';
+      const filename = 'doubao_' + timestamp + '_' + (i + 1) + '.' + ext;
+      return { filename, url };
+    });
 
-    for (let i = 0; i < selected.length; i++) {
-      try {
-        const url = selected[i].url;
-        const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 17);
-        const ext = url.match(/\.(png|jpe?g|webp)/)?.[1] || 'png';
-        const filename = 'doubao_' + timestamp + '_' + (i + 1) + '.' + ext;
+    showDownloadProgress(0, total, 0);
+    showPopupToast('正在下载无水印图片...', 'info', `0/${total}`);
 
-        // 1) 通过 background 拉图片 base64（避免 CORS）
-        const fetchResp = await new Promise((resolve, reject) => {
-          chrome.runtime.sendMessage(
-            { type: 'FETCH_IMAGE', url: url },
-            (response) => {
-              if (chrome.runtime.lastError) {
-                reject(new Error(chrome.runtime.lastError.message));
-                return;
-              }
-              if (response && response.success) {
-                resolve(response);
-              } else {
-                reject(new Error(response?.error || '获取图片数据失败'));
-              }
-            }
-          );
-        });
-
-        // 2) 通过 background → native host 把 base64 写入 targetDir
-        const writeResp = await chrome.runtime.sendMessage({
-          type: 'WRITE_FILE_NATIVE',
-          dir: targetDir,
-          filename: filename,
-          dataBase64: fetchResp.data
-        });
-        if (writeResp && writeResp.success) {
-          successCount++;
-        } else {
-          failCount++;
-        }
-
-        // 更新进度
-        const completed = i + 1;
-        const percent = Math.round((completed / selected.length) * 100);
-        showDownloadProgress(completed, selected.length, percent);
-        const progressTip = failCount > 0
-          ? `${completed}/${selected.length}（失败 ${failCount} 张）`
-          : `${completed}/${selected.length}`;
-        showPopupToast('正在下载无水印图片...', 'info', progressTip);
-
-        // 间隔一点点，避免 native host 排队过快
-        if (i < selected.length - 1) {
-          await new Promise(r => setTimeout(r, 80));
-        }
-      } catch (e) {
-        failCount++;
-        const completed = i + 1;
-        const percent = Math.round((completed / selected.length) * 100);
-        showDownloadProgress(completed, selected.length, percent);
-        showPopupToast('正在下载无水印图片...', 'info', `${completed}/${selected.length}（失败 ${failCount} 张）`);
+    // 一次性把所有 items 发给 background → native host，native host 会用 ThreadPoolExecutor 并行下载
+    // native host 每完成一张图片就通过 connectNative 长连接推送 download_progress 消息
+    // background.js 转发为 DOWNLOAD_PROGRESS_UPDATE 消息，popup 通过监听回调实时刷新进度
+    chrome.runtime.sendMessage({
+      type: 'DOWNLOAD_URL_NATIVE',
+      dir: targetDir,
+      items: downloadItems
+    }, (response) => {
+      if (chrome.runtime.lastError) {
+        showPopupToast('发送下载请求失败: ' + (chrome.runtime.lastError.message || ''), 'error');
+        $downloadBtn.disabled = false;
+        $downloadBtn.textContent = '下载选中';
+        hideDownloadProgress();
+        return;
       }
-    }
-
-    // 下载完成
-    hideDownloadProgress();
-    $downloadBtn.disabled = false;
-    $downloadBtn.textContent = '下载选中';
-    updateSelection();
-
-    // 显示完成 toast
-    if (failCount > 0 && successCount === 0) {
-      showPopupToast(`❌ 下载失败 ${failCount} 张，请确认 native host 已就绪`, 'error');
-    } else if (failCount > 0) {
-      showPopupToast(`下载完成：成功 ${successCount} 张，失败 ${failCount} 张`, 'error');
-    } else {
-      showPopupToast(`✨ 已成功下载 ${successCount} 张图片到「${targetDir}」`, 'success');
-    }
-
-    // 同时在页面中也显示 toast（如果页面还在）
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab) {
-        chrome.tabs.sendMessage(tab.id, {
-          type: 'SHOW_TOAST',
-          text: failCount > 0
-            ? `下载完成：成功 ${successCount} 张，失败 ${failCount} 张`
-            : `已下载 ${successCount} 张无水印图片到 ${targetDir}`,
-          toastType: failCount > 0 ? 'info' : 'success'
-        });
+      if (response && response.success === false) {
+        showPopupToast('下载启动失败: ' + (response.error || '未知错误'), 'error');
+        $downloadBtn.disabled = false;
+        $downloadBtn.textContent = '下载选中';
+        hideDownloadProgress();
       }
-    } catch (e) { /* ignore */ }
+    });
   });
+
+  // ── 下载进度回调：监听 background.js 转发的进度更新 ──
+  // native_host.py 每完成一张图片就通过 connectNative 长连接推送 download_progress
+  // background.js 转发为 DOWNLOAD_PROGRESS_UPDATE 消息，popup 实时刷新 UI
+  let downloadTotal = 0;
+  let downloadTargetDir = '';
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'DOWNLOAD_PROGRESS_UPDATE') {
+      // 收到进度回调：native host 完成了一张图片
+      const completed = message.completed;
+      const total = message.total;
+      const success = message.success;
+      const fail = message.fail;
+
+      const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+      showDownloadProgress(completed, total, percent);
+      showPopupToast(
+        completed < total ? `正在下载第 ${completed + 1} 张...` : '下载完成，正在处理...',
+        'info',
+        `${completed}/${total}`
+      );
+
+    } else if (message.type === 'DOWNLOAD_COMPLETE') {
+      // 全部下载完成
+      const successCount = message.successCount;
+      const failCount = message.failCount;
+      hideDownloadProgress();
+      $downloadBtn.disabled = false;
+      $downloadBtn.textContent = '下载选中';
+
+      const s = chrome.storage.local.get(['downloadDirFullPath'], (stored) => {
+        const targetDir = stored.downloadDirFullPath || '';
+        if (failCount > 0 && successCount === 0) {
+          showPopupToast(`❌ 下载失败 ${failCount} 张，请确认 native host 已就绪`, 'error');
+        } else if (failCount > 0) {
+          showPopupToast(`下载完成：成功 ${successCount} 张，失败 ${failCount} 张`, 'error');
+        } else {
+          const targetMsg = targetDir ? `到「${targetDir}」` : '';
+          showPopupToast(`✨ 已成功下载 ${successCount} 张图片${targetMsg}`, 'success');
+        }
+      });
+
+      // 同时在页面中也显示 toast
+      try {
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+          if (tabs && tabs[0]) {
+            chrome.tabs.sendMessage(tabs[0].id, {
+              type: 'SHOW_TOAST',
+              text: failCount > 0
+                ? `下载完成：成功 ${successCount} 张，失败 ${failCount} 张`
+                : `已下载 ${successCount} 张无水印图片`,
+              toastType: failCount > 0 ? 'info' : 'success'
+            });
+          }
+        });
+      } catch (e) { /* ignore */ }
+
+    } else if (message.type === 'DOWNLOAD_ERROR') {
+      hideDownloadProgress();
+      $downloadBtn.disabled = false;
+      $downloadBtn.textContent = '下载选中';
+      showPopupToast('下载失败: ' + (message.error || '未知错误'), 'error');
+    }
+  });
+
+  // ── 进度恢复：popup 重新打开时 ──
+  // 如果 popup 关闭后重新打开，下载仍在进行中，
+  // background.js 维护的长连接会持续推送 DOWNLOAD_PROGRESS_UPDATE，
+  // popup 的 onMessage 监听器会自动接收并刷新进度
 
   // ── 框选支持 ─────────────────────────────────────────────────────────────
   const $selRect = document.getElementById('selectionRect');
@@ -736,7 +753,7 @@ function deduplicateImages(images) {
 }
 
 // ── 渲染图片网格 ──────────────────────────────────────────────────────────────────────
-function renderImageGrid() {
+async function renderImageGrid() {
   $imageGrid.innerHTML = '';
 
   if (imageList.length === 0) {
@@ -754,6 +771,7 @@ function renderImageGrid() {
 
   sortedIndices.forEach(idx => {
     const img = imageList[idx];
+
     const card = document.createElement('div');
     card.className = 'image-card';
     card.dataset.index = idx;
@@ -802,7 +820,7 @@ function setHookStatus(active, text) {
     $hookStatusText.onclick = null;
   } else {
     $hookStatus.className = 'status-dot inactive pulse';
-    $hookStatusText.innerHTML = '⚠️ 未生效 · <u>点击刷新豆包页面</u>';
+    $hookStatusText.innerHTML = '未生效 · <u>请点击刷新豆包页面</u>';
     $hookStatusText.style.color = '#ff4d4f';
     $hookStatusText.classList.add('clickable');
     $hookStatusText.title = '插件已开启，需刷新豆包页面才能生效';
@@ -812,9 +830,9 @@ function setHookStatus(active, text) {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tab && tab.url && tab.url.includes('doubao.com')) {
           chrome.tabs.reload(tab.id);
-          showPopupToast('✅ 插件已开启，正在刷新豆包页面…', 'info');
+          showPopupToast('插件已开启，正在刷新豆包页面…', 'info');
         } else {
-          showPopupToast('⚠️ 请先打开豆包对话页面，再点击此处刷新', 'error');
+          showPopupToast('请先打开豆包对话页面，再点击此处刷新', 'error');
         }
       } catch (e) { /* ignore */ }
     };

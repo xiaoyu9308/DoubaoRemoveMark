@@ -17,9 +17,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       files: ['injected.js'],
       world: 'MAIN',
       injectImmediately: true
-    }).catch(err => {
-      console.error('[豆包去水印] 注入主世界脚本失败:', err);
-    });
+    }).catch(() => {});
   }
 });
 
@@ -64,7 +62,6 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         showToastInTab(tab.id, '未找到无水印图片URL', 'error');
       }
     } catch (e) {
-      console.error('[豆包去水印] 获取图片信息失败:', e);
       if (info.srcUrl) {
         const url = convertToNoWatermarkUrl(info.srcUrl) || info.srcUrl;
         await downloadImage(url, tab.id);
@@ -91,7 +88,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         showToastInTab(tab.id, '无水印链接已复制', 'success');
       }
     } catch (e) {
-      console.error('[豆包去水印] 复制链接失败:', e);
+      // 复制链接失败，静默
     }
   }
 });
@@ -122,7 +119,6 @@ function convertToNoWatermarkUrl(url) {
 
     return null;
   } catch (e) {
-    console.error('[豆包去水印] URL转换失败:', e);
     return null;
   }
 }
@@ -139,7 +135,7 @@ async function downloadImage(url, tabId, filename, customDir) {
 
     // 生成文件名
     if (!filename) {
-      const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 17);
+const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
       const ext = url.match(/\.(png|jpe?g|webp)/)?.[1] || 'png';
       filename = 'doubao_' + timestamp + '.' + ext;
     }
@@ -156,9 +152,7 @@ async function downloadImage(url, tabId, filename, customDir) {
     if (tabId) {
       showToastInTab(tabId, '无水印图片下载中...', 'success');
     }
-    console.log('[豆包去水印] 下载已开始, ID:', downloadId, '路径:', fullPath);
   } catch (e) {
-    console.error('[豆包去水印] 下载失败:', e);
     if (tabId) {
       showToastInTab(tabId, '下载失败: ' + e.message, 'error');
     }
@@ -177,7 +171,7 @@ async function batchDownload(urls, tabId, customDir) {
   for (let i = 0; i < urls.length; i++) {
     try {
       const url = urls[i].url || urls[i];
-      const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 17);
+const timestamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
       const ext = url.match(/\.(png|jpe?g|webp)/)?.[1] || 'png';
       const filename = 'doubao_' + timestamp + '.' + ext;
       await downloadImage(url, null, filename, downloadDir);
@@ -185,7 +179,7 @@ async function batchDownload(urls, tabId, customDir) {
       // 间隔500ms避免下载太快
       await new Promise(r => setTimeout(r, 500));
     } catch (e) {
-      console.error('[豆包去水印] 批量下载第', i + 1, '张失败:', e);
+      // 单张下载失败，继续下一张
     }
   }
   if (tabId) {
@@ -259,6 +253,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;
 
+    case 'DOWNLOAD_URL_NATIVE':
+      // 通过 native host 长连接（connectNative）直接用 Python 下载 URL 写入磁盘
+      // 使用长连接，native host 每完成一张图片就推送 download_progress 消息，
+      // background 收到后转发给 popup 实时刷新进度，无需轮询
+      downloadUrlNativeWithProgress(message.dir, message.items, sendResponse);
+      return true; // 异步响应
+
     case 'WRITE_FILE_NATIVE':
       // 通过 native host 把 base64 内容写入指定绝对路径下的文件
       writeFileNative(message.dir, message.filename, message.dataBase64)
@@ -288,21 +289,19 @@ async function fetchImageData(url) {
       throw new Error('HTTP ' + response.status);
     }
     const blob = await response.blob();
-    const mimeType = blob.type || 'image/png';
 
-    // 将 Blob 转为 base64
-    // 分块处理避免 call stack overflow
-    const arrayBuffer = await blob.arrayBuffer();
-    const bytes = new Uint8Array(arrayBuffer);
-    const CHUNK_SIZE = 0x8000; // 32KB per chunk
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-      const chunk = bytes.subarray(i, Math.min(i + CHUNK_SIZE, bytes.length));
-      binary += String.fromCharCode.apply(null, chunk);
-    }
-    const base64 = btoa(binary);
+    // 用 FileReader.readAsDataURL 高效转换，避免手动分块拼接导致调用栈溢出
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('FileReader failed'));
+      reader.readAsDataURL(blob);
+    });
 
-    return { success: true, data: base64, mimeType: mimeType };
+    // 从 data URL 中提取纯 base64 数据（去掉 "data:image/xxx;base64," 前缀）
+    const base64 = dataUrl.split(',', 2)[1];
+
+    return { success: true, data: base64 };
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -387,6 +386,76 @@ async function chooseDirectory(defaultLocation) {
     return result || { success: false, error: 'Native Messaging 无响应' };
   } catch (e) {
     return { success: false, error: e.message };
+  }
+}
+
+// ── 通过 native host 长连接下载 URL，实时接收进度回调 ──────────
+function downloadUrlNativeWithProgress(dir, items, sendResponse) {
+  try {
+    const port = chrome.runtime.connectNative('com.doubao.remove.mark');
+    let downloadFinished = false; // 标记下载是否已完成（正常或异常），防止 onDisconnect 误报错误
+
+    port.onMessage.addListener((msg) => {
+      if (msg.type === 'download_progress') {
+        // 每完成一张图片，native host 推送进度消息
+        // 转发给 popup 实时刷新进度显示
+        chrome.runtime.sendMessage({
+          type: 'DOWNLOAD_PROGRESS_UPDATE',
+          completed: msg.completed,
+          total: msg.total,
+          success: msg.success,
+          fail: msg.fail,
+          filename: msg.filename,
+          itemSuccess: msg.item_success,
+          itemError: msg.item_error,
+        }).catch(() => {
+          // popup 可能已关闭，忽略发送失败
+        });
+      } else if (msg.type === 'download_complete') {
+        // 全部下载完成
+        downloadFinished = true;
+        chrome.runtime.sendMessage({
+          type: 'DOWNLOAD_COMPLETE',
+          successCount: msg.success_count,
+          failCount: msg.fail_count,
+          results: msg.results,
+        }).catch(() => {});
+        // 长连接任务完成，断开连接
+        port.disconnect();
+      } else if (msg.success === false && msg.error) {
+        // 错误消息（如目录不存在等）
+        downloadFinished = true;
+        chrome.runtime.sendMessage({
+          type: 'DOWNLOAD_ERROR',
+          error: msg.error,
+        }).catch(() => {});
+        port.disconnect();
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError;
+      // 如果 downloadFinished 为 true，说明是正常完成后的断开（我们主动 disconnect），
+      // 此时 Python 进程已退出，Chrome 报 "Native host has exited" 是正常的，不算错误
+      if (downloadFinished) {
+        return;
+      }
+      if (err) {
+        chrome.runtime.sendMessage({
+          type: 'DOWNLOAD_ERROR',
+          error: err.message,
+        }).catch(() => {});
+      }
+    });
+
+    // 发送下载命令
+    port.postMessage({ command: 'download_url', dir: dir, items: items });
+
+    // 立即响应 popup：下载已启动
+    sendResponse({ success: true, message: '下载已在后台启动' });
+
+  } catch (e) {
+    sendResponse({ success: false, error: e.message });
   }
 }
 

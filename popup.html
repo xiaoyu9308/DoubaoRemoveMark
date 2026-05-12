@@ -261,7 +261,7 @@
     }
     .image-card .quality-badge {
       position: absolute;
-      bottom: 4px; left: 4px;
+      top: 4px; left: 4px;
       background: rgba(0,0,0,.55);
       color: #fff;
       font-size: 9px;
@@ -443,6 +443,19 @@
     </div>
   </div>
 
+  <!-- 图片选择区 -->
+  <div class="section">
+    <div class="section-title">🖼️ 无水印原图（点击选择，框选多选）<span class="sort-toggle desc" id="sortToggle"><span id="sortLabel">倒序</span><span class="sort-arrow">▼</span></span></div>
+    <div style="position:relative;">
+      <div class="selection-rect" id="selectionRect"></div>
+      <div class="image-grid" id="imageGrid"></div>
+    </div>
+    <div class="empty-state" id="emptyState">
+      <div class="icon">📭</div>
+      <p>未检测到豆包AI生成的图片<br>请在豆包对话页面生成图片后刷新</p>
+    </div>
+  </div>
+
   <!-- 下载目录 -->
   <div class="section">
     <div class="section-title">📁 下载目录</div>
@@ -462,19 +475,6 @@
 
   <div class="tip">
     💡 在豆包AI对话页面右键图片，可直接"下载原图（无水印）"
-  </div>
-
-  <!-- 图片选择区 -->
-  <div class="section">
-    <div class="section-title">🖼️ 无水印原图（点击选择，框选多选）<span class="sort-toggle desc" id="sortToggle"><span id="sortLabel">倒序</span><span class="sort-arrow">▼</span></span></div>
-    <div style="position:relative;">
-      <div class="selection-rect" id="selectionRect"></div>
-      <div class="image-grid" id="imageGrid"></div>
-    </div>
-    <div class="empty-state" id="emptyState">
-      <div class="icon">📭</div>
-      <p>未检测到豆包AI生成的图片<br>请在豆包对话页面生成图片后刷新</p>
-    </div>
   </div>
 
   <!-- 操作栏（sticky 固定在底部，滚动时始终可见） -->

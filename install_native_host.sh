@@ -49,7 +49,7 @@ import sys
 import traceback
 import datetime
 
-_LOG_PATH = os.path.expanduser('~/doubao_native_host.log')
+_LOG_PATH = '/tmp/doubao_native_host.log'
 
 
 def _log(msg):

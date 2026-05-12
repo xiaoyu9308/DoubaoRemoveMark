@@ -4,87 +4,44 @@
 接收 Chrome 插件消息，执行 macOS open 命令打开文件夹
 """
 
-# ============================================================
-# 启动点日志 + 全局异常捕获
-# 注意：必须放在文件最顶部，任何 import/代码出错都能被记录。
-# 之前日志写入放在 read_message() 之后，导致早期崩溃时日志里看不到任何痕迹，
-# Chrome 就只会笼统地报 "Native host has exited."。
-# ============================================================
 import os
 import sys
-import traceback
-import datetime
-
-_LOG_PATH = os.path.expanduser('~/doubao_native_host.log')
-# 默认不写调试日志。排查问题时可在 native messaging host 启动环境中设置 DOUBAO_DEBUG=1，
-# 或在本文件顶部临时改为 True 打开（完成后依然必须重新部署到 ~/Library/Application Support/DoubaoNativeHost/）。
-_DEBUG_LOG = os.environ.get('DOUBAO_DEBUG') == '1'
-
-
-def _log(msg):
-    if not _DEBUG_LOG:
-        return
-    try:
-        with open(_LOG_PATH, 'a') as _f:
-            _f.write(f'[{datetime.datetime.now()}] {msg}\n')
-    except Exception:
-        # 日志写不出也不能影响主流程
-        pass
-
-
-# 启动就先打一条点位日志，证明脚本被 Chrome 拉起来过
-_log('========== native_host START ==========')
-_log(f'  argv      = {sys.argv}')
-_log(f'  executable= {sys.executable}')
-_log(f'  cwd       = {os.getcwd()}')
-_log(f'  python    = {sys.version}')
-_log(f'  env.PATH  = {os.environ.get("PATH", "")!r}')
-_log(f'  env.HOME  = {os.environ.get("HOME", "")!r}')
-
-
-def _excepthook(exc_type, exc_value, exc_tb):
-    """捕获所有未处理异常，写入日志后再退出"""
-    _log('!!! UNCAUGHT EXCEPTION !!!')
-    _log(''.join(traceback.format_exception(exc_type, exc_value, exc_tb)))
-
-
-sys.excepthook = _excepthook
-
-
 import struct
 import json
 import subprocess
+import threading
 
 
 def read_message():
     """从 stdin 读取 Chrome Native Messaging 消息"""
-    _log('  read_message: waiting for 4-byte length header on stdin ...')
     raw_length = sys.stdin.buffer.read(4)
     if len(raw_length) == 0:
-        _log('  read_message: stdin closed (0 bytes) -> exit(0)')
         sys.exit(0)
     message_length = struct.unpack('=I', raw_length)[0]
-    _log(f'  read_message: got length={message_length}, reading payload ...')
     message = sys.stdin.buffer.read(message_length).decode('utf-8')
-    _log(f'  read_message: payload={message!r}')
     return json.loads(message)
 
 
 def send_message(message):
-    """向 stdout 写入 Chrome Native Messaging 消息"""
-    encoded = json.dumps(message).encode('utf-8')
-    sys.stdout.buffer.write(struct.pack('=I', len(encoded)))
-    sys.stdout.buffer.write(encoded)
-    sys.stdout.buffer.flush()
-    _log(f'  send_message: sent {len(encoded)} bytes -> {message}')
+    """向 stdout 写入 Chrome Native Messaging 消息（线程安全）"""
+    _send_lock.acquire()
+    try:
+        encoded = json.dumps(message).encode('utf-8')
+        sys.stdout.buffer.write(struct.pack('=I', len(encoded)))
+        sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
+    finally:
+        _send_lock.release()
+
+# send_message 的线程锁：ThreadPoolExecutor 并行下载时，多个线程会同时调用 send_message
+# 推送进度，stdout 不是线程安全的，必须加锁
+_send_lock = threading.Lock()
 
 
-def main():
-    message = read_message()
+def handle_message(message):
+    """处理单条消息（可在子线程中运行）"""
     command = message.get('command', '')
     path = message.get('path', '')
-
-    _log(f'  Received: command={command}, path={path}')
 
     if command == 'ping':
         # 诊断命令：返回 Python 环境信息
@@ -96,27 +53,23 @@ def main():
             'platform': platform.platform(),
             'cwd': os.getcwd(),
         }
-        _log(f'  ping response: {info}')
         send_message(info)
 
     elif command == 'open' and path:
         try:
             # 目录不存在直接返回错误（不再自动创建，避免掩盖错误路径问题）
             if not os.path.exists(path):
-                _log(f'  directory does not exist: {path}')
                 send_message({'success': False, 'error': f'Directory does not exist: {path}'})
                 return
             result = subprocess.run(
                 ['open', path],
                 capture_output=True, text=True, timeout=5
             )
-            _log(f'  returncode={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}')
             if result.returncode == 0:
                 send_message({'success': True})
             else:
                 send_message({'success': False, 'error': result.stderr.strip()})
         except Exception as e:
-            _log(f'  Exception: {e}')
             send_message({'success': False, 'error': str(e)})
 
     elif command == 'choose_dir':
@@ -126,7 +79,6 @@ def main():
         #      需要用 POSIX path 转成 "/Users/mars/Downloads"
         prompt = message.get('prompt', '请选择下载目录')
         default_loc = message.get('default_location', '')
-        _log(f'  choose_dir: prompt={prompt!r}, default_location={default_loc!r}')
         try:
             # 默认到用户 home 而非 Downloads，避免 osascript 为读取 Downloads 触发 macOS TCC 权限弹窗。
             # 仅在调用方明确传了一个非受保护路径时才使用该路径作为默认位置。
@@ -154,17 +106,14 @@ def main():
                     f'set chosen to choose folder with prompt "{prompt}"\n'
                     f'return POSIX path of chosen'
                 )
-            _log(f'  choose_dir: running osascript script:\n{script}')
             result = subprocess.run(
                 ['osascript', '-e', script],
                 capture_output=True, text=True, timeout=120
             )
-            _log(f'  choose_dir: returncode={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}')
             if result.returncode != 0:
                 # returncode=1 通常是用户取消（"User canceled."）
                 err = (result.stderr or '').strip()
                 if 'User canceled' in err or '-128' in err:
-                    _log('  choose_dir: user canceled')
                     send_message({'success': False, 'canceled': True, 'error': 'User canceled'})
                 else:
                     send_message({'success': False, 'error': err or 'osascript failed'})
@@ -173,18 +122,191 @@ def main():
             chosen_path = result.stdout.strip()
             if chosen_path.endswith('/') and len(chosen_path) > 1:
                 chosen_path = chosen_path[:-1]
-            _log(f'  choose_dir: SUCCESS chosen_path={chosen_path!r}')
             if not chosen_path or not os.path.isdir(chosen_path):
                 send_message({'success': False, 'error': f'Invalid path returned: {chosen_path!r}'})
                 return
             send_message({'success': True, 'path': chosen_path})
         except subprocess.TimeoutExpired:
-            _log('  choose_dir: osascript timeout (120s)')
             send_message({'success': False, 'error': 'choose folder dialog timeout'})
         except Exception as e:
-            _log(f'  choose_dir Exception: {e}')
-            _log(traceback.format_exc())
             send_message({'success': False, 'error': str(e)})
+
+    elif command == 'download_url':
+        # 直接用 Python 并行下载 URL 到指定目录
+        # 省去浏览器 fetch + base64 转换 + native messaging 传输的开销
+        # 使用 ThreadPoolExecutor 并行下载，每完成一张就通过 stdout 回调推送进度
+        import base64
+        import urllib.request
+        import urllib.parse
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        target_dir = message.get('dir', '')
+        items = message.get('items', [])  # [{filename, url}, ...]
+
+        if not target_dir or not items:
+            send_message({'success': False, 'error': 'Missing dir or items'})
+            return
+        if not os.path.isdir(target_dir):
+            send_message({'success': False, 'error': f'Directory does not exist: {target_dir}'})
+            return
+
+        total_count = len(items)
+        progress_lock = threading.Lock()
+        progress_completed = 0
+        progress_success = 0
+        progress_fail = 0
+
+        def download_one_item(idx, item):
+            """下载单个文件，返回结果 dict"""
+            filename = item.get('filename', '')
+            url = item.get('url', '')
+            if not filename or not url:
+                return {'filename': filename, 'success': False, 'error': 'Missing filename or url'}
+
+            # 安全：filename 不能包含路径分隔符
+            if '/' in filename or '\\' in filename or filename.startswith('.'):
+                return {'filename': filename, 'success': False, 'error': f'Invalid filename: {filename}'}
+
+            full_path = os.path.join(target_dir, filename)
+            # 处理重名
+            if os.path.exists(full_path):
+                base, ext = os.path.splitext(filename)
+                i = 1
+                while True:
+                    cand = os.path.join(target_dir, f'{base} ({i}){ext}')
+                    if not os.path.exists(cand):
+                        full_path = cand
+                        break
+                    i += 1
+
+            try:
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                    'Accept': 'image/*',
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    with open(full_path, 'wb') as f:
+                        total_read = 0
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            total_read += len(chunk)
+                file_size = os.path.getsize(full_path)
+                return {'filename': filename, 'success': True, 'path': full_path, 'bytes': file_size}
+            except urllib.error.URLError as ue:
+                return {'filename': filename, 'success': False, 'error': f'URLError: {ue.reason}'}
+            except urllib.error.HTTPError as he:
+                return {'filename': filename, 'success': False, 'error': f'HTTP {he.code}: {he.reason}'}
+            except Exception as e:
+                return {'filename': filename, 'success': False, 'error': str(e)}
+
+        def on_item_complete(idx, item, result):
+            """每完成一个下载就回调推送进度消息"""
+            nonlocal progress_completed, progress_success, progress_fail
+            with progress_lock:
+                progress_completed += 1
+                if result.get('success'):
+                    progress_success += 1
+                else:
+                    progress_fail += 1
+                completed = progress_completed
+                success = progress_success
+                fail = progress_fail
+
+            # 回调推送进度消息
+            send_message({
+                'type': 'download_progress',
+                'completed': completed,
+                'total': total_count,
+                'success': success,
+                'fail': fail,
+                'filename': result.get('filename', ''),
+                'item_success': result.get('success', False),
+                'item_error': result.get('error', None),
+            })
+
+        # 使用 ThreadPoolExecutor 并行下载
+        results = []
+        with ThreadPoolExecutor(max_workers=min(8, total_count)) as executor:
+            future_to_item = {}
+            for idx, item in enumerate(items):
+                future = executor.submit(download_one_item, idx, item)
+                future_to_item[future] = (idx, item)
+
+            for future in as_completed(future_to_item):
+                idx, item = future_to_item[future]
+                try:
+                    result = future.result()
+                    result['index'] = idx
+                except Exception as e:
+                    filename = item.get('filename', '')
+                    result = {'filename': filename, 'success': False, 'error': str(e), 'index': idx}
+
+                results.append(result)
+                on_item_complete(idx, item, result)
+
+        # 按原始索引排序结果
+        results.sort(key=lambda r: r.get('index', 0))
+
+        success_count = sum(1 for r in results if r.get('success'))
+        fail_count = len(results) - success_count
+
+        # 发送最终完成消息
+        send_message({
+            'type': 'download_complete',
+            'success': True,
+            'results': results,
+            'success_count': success_count,
+            'fail_count': fail_count,
+        })
+
+    elif command == 'batch_write':
+        # 批量写入多个文件（一次 native messaging 往返）
+        # 减少 Chrome ↔ Python 进程之间的通信开销
+        import base64
+        target_dir = message.get('dir', '')
+        files = message.get('files', [])  # [{filename, data_base64}, ...]
+        if not target_dir or not files:
+            send_message({'success': False, 'error': 'Missing dir or files'})
+            return
+        if not os.path.isdir(target_dir):
+            send_message({'success': False, 'error': f'Directory does not exist: {target_dir}'})
+            return
+        results = []
+        for f_info in files:
+            filename = f_info.get('filename', '')
+            b64 = f_info.get('data_base64', '')
+            if not filename or not b64:
+                results.append({'filename': filename, 'success': False, 'error': 'Missing filename or data'})
+                continue
+            try:
+                # 安全：filename 不能包含路径分隔符
+                if '/' in filename or '\\' in filename or filename.startswith('.'):
+                    results.append({'filename': filename, 'success': False, 'error': f'Invalid filename: {filename}'})
+                    continue
+                full_path = os.path.join(target_dir, filename)
+                # 处理重名
+                if os.path.exists(full_path):
+                    base, ext = os.path.splitext(filename)
+                    idx = 1
+                    while True:
+                        cand = os.path.join(target_dir, f'{base} ({idx}){ext}')
+                        if not os.path.exists(cand):
+                            full_path = cand
+                            break
+                        idx += 1
+                raw = base64.b64decode(b64)
+                with open(full_path, 'wb') as f:
+                    f.write(raw)
+                results.append({'filename': filename, 'success': True, 'path': full_path, 'bytes': len(raw)})
+            except Exception as e:
+                results.append({'filename': filename, 'success': False, 'error': str(e)})
+        success_count = sum(1 for r in results if r.get('success'))
+        fail_count = len(results) - success_count
+        send_message({'success': True, 'results': results, 'success_count': success_count, 'fail_count': fail_count})
 
     elif command == 'write_file':
         # 把 base64 内容写入指定绝对路径的文件
@@ -193,7 +315,6 @@ def main():
         target_dir = message.get('dir', '')
         filename = message.get('filename', '')
         b64 = message.get('data_base64', '')
-        _log(f'  write_file: dir={target_dir!r}, filename={filename!r}, data_len={len(b64)}')
         if not target_dir or not filename:
             send_message({'success': False, 'error': 'Missing dir or filename'})
             return
@@ -203,7 +324,6 @@ def main():
                 send_message({'success': False, 'error': f'Invalid filename: {filename}'})
                 return
             if not os.path.isdir(target_dir):
-                _log(f'  write_file: dir not exist: {target_dir}')
                 send_message({'success': False, 'error': f'Directory does not exist: {target_dir}'})
                 return
             full_path = os.path.join(target_dir, filename)
@@ -217,15 +337,11 @@ def main():
                         full_path = cand
                         break
                     idx += 1
-                _log(f'  write_file: filename conflict, using {full_path}')
             raw = base64.b64decode(b64)
             with open(full_path, 'wb') as f:
                 f.write(raw)
-            _log(f'  write_file: SUCCESS wrote {len(raw)} bytes to {full_path}')
             send_message({'success': True, 'path': full_path, 'bytes': len(raw)})
         except Exception as e:
-            _log(f'  write_file Exception: {e}')
-            _log(traceback.format_exc())
             send_message({'success': False, 'error': str(e)})
 
     elif command == 'resolve_dir':
@@ -247,12 +363,10 @@ def main():
                     ['mdfind', '-name', marker],
                     capture_output=True, text=True, timeout=timeout
                 )
-                _log(f'  mdfind returncode={result.returncode}, stdout={result.stdout!r}')
                 hits = [p for p in result.stdout.strip().split('\n') if p and os.path.basename(p) == marker]
                 # 过滤实际存在的（mdfind 索引可能滞后）
                 return [p for p in hits if os.path.isfile(p)]
-            except Exception as e:
-                _log(f'  mdfind error: {e}')
+            except Exception:
                 return []
 
         def _try_find(root, timeout=6):
@@ -269,11 +383,9 @@ def main():
                     f"find '{root}' -maxdepth 7 -name '{marker}' -print -quit 2>/dev/null",
                     capture_output=True, text=True, timeout=timeout, shell=True
                 )
-                _log(f'  find {root}: returncode={result.returncode}, stdout={result.stdout!r}')
                 hits = [p for p in result.stdout.strip().split('\n') if p and os.path.basename(p) == marker]
                 return [p for p in hits if os.path.isfile(p)]
-            except Exception as e:
-                _log(f'  find {root} error: {e}')
+            except Exception:
                 return []
 
         try:
@@ -284,7 +396,6 @@ def main():
 
             # 策略 2: 客户端提供的候选根（若有）
             if not paths and client_search_roots:
-                _log(f'  mdfind miss, trying client search_roots: {client_search_roots}')
                 for root in client_search_roots:
                     expanded = os.path.expanduser(root)
                     paths = _try_find(expanded, timeout=4)
@@ -293,7 +404,6 @@ def main():
 
             # 策略 3: 系统常见根目录
             if not paths:
-                _log('  no hit yet, trying system common roots')
                 home = os.environ.get('HOME', os.path.expanduser('~'))
                 # 注意：这些路径可能因 macOS TCC 权限保护无法访问，但能访问的会快速命中
                 fallback_roots = [
@@ -315,7 +425,6 @@ def main():
                         break
 
             if not paths:
-                _log(f'  resolve_dir: marker {marker} NOT FOUND anywhere')
                 send_message({
                     'success': False,
                     'error': 'Marker file not found by mdfind/find',
@@ -326,24 +435,38 @@ def main():
             # 取第一个命中
             file_path = paths[0]
             dir_path = os.path.dirname(file_path)
-            _log(f'  resolve_dir SUCCESS: dir={dir_path}, file={file_path}')
             send_message({'success': True, 'path': dir_path, 'file': file_path, 'all_hits': paths})
         except Exception as e:
-            _log(f'  resolve_dir Exception: {e}')
-            _log(traceback.format_exc())
             send_message({'success': False, 'error': str(e)})
     else:
         send_message({'success': False, 'error': 'Unknown command or missing path'})
 
 
+def main():
+    """
+    主循环：支持 connectNative 长连接模式
+    - 短命令（ping, open, choose_dir 等）：同步执行，立即返回
+    - 长命令（download_url）：在子线程中执行，主线程继续读取下一条消息
+    - 当 stdin 关闭时（Chrome 断开连接），自动退出
+    """
+    while True:
+        try:
+            message = read_message()
+        except SystemExit:
+            raise
+        except Exception:
+            break
+
+        command = message.get('command', '')
+        # download_url 是长时间运行的任务，在子线程中执行，这样不会阻塞主循环
+        # 子线程中通过 send_message 推送进度和完成消息
+        if command == 'download_url':
+            t = threading.Thread(target=handle_message, args=(message,), daemon=True)
+            t.start()
+        else:
+            # 短命令同步执行
+            handle_message(message)
+
+
 if __name__ == '__main__':
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as e:
-        _log(f'!!! main() raised: {e}')
-        _log(traceback.format_exc())
-        raise
-    finally:
-        _log('========== native_host END ==========')
+    main()

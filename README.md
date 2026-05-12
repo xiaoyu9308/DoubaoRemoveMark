@@ -222,7 +222,7 @@ Native Host 支持以下命令：
 
 - 确认已运行 `./install_native_host.sh` 安装 Native Host
 - 在 Popup 中检查 Native Messaging 诊断状态
-- 检查 `~/doubao_native_host.log` 日志文件
+- 检查 `/tmp/doubao_native_host.log` 日志文件
 
 ### macOS 提示「python3 要访问你的下载文件夹」
 
