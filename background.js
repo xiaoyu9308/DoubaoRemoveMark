@@ -212,7 +212,44 @@ function showToastInTab(tabId, message, type) {
   });
 }
 
-// ── 监听来自content script和popup的消息 ──────────────────────────────────────
+// ── popup 长连接：通过 Port 直接转发下载进度，避免 sendMessage 的注册/查找开销 ──
+// popup 打开时会 chrome.runtime.connect({ name: 'download-progress' }) 与本 SW 建立长连接，
+// 本 SW 把当前活跃的 Port 缓存下来，下载进度消息直接走 Port.postMessage 推送给 popup。
+// 多个 popup 实例（极少见）都会被加入集合，全部广播。
+const popupPorts = new Set();
+// 缓存最近一次 download_complete 消息：popup 关闭后可能重开，但 SW 已经收到了完成消息，
+// 这种情况下需要在新 popup 连接时立刻补发，避免下载已完成但 popup 还显示 "下载中..."
+let lastCompleteSnapshot = null;
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'download-progress') return;
+  popupPorts.add(port);
+  // 如果有未消费的完成消息，立刻补发
+  if (lastCompleteSnapshot) {
+    try { port.postMessage(lastCompleteSnapshot); } catch (e) { /* ignore */ }
+    lastCompleteSnapshot = null;
+  }
+  port.onDisconnect.addListener(() => {
+    popupPorts.delete(port);
+  });
+});
+
+function postToPopup(msg) {
+  // 向所有活跃 popup Port 广播
+  if (popupPorts.size === 0) return false;
+  let delivered = false;
+  for (const p of popupPorts) {
+    try {
+      p.postMessage(msg);
+      delivered = true;
+    } catch (e) {
+      // 单个 port 异常忽略，不影响其他
+    }
+  }
+  return delivered;
+}
+
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message.type) {
     case 'DOWNLOAD_IMAGE':
@@ -389,7 +426,11 @@ async function chooseDirectory(defaultLocation) {
   }
 }
 
-// ── 通过 native host 长连接下载 URL，实时接收进度回调 ──────────
+// ── 通过 native host 长连接下载 URL，实时接收进度回调 ──
+// 进度消息走 popup Port (postToPopup) 而非 sendMessage：
+//   1. Port 是已建立的长连接，省去 sendMessage 每次注册接收方/查找的开销
+//   2. 消息更紧凑、延迟更低、顺序更稳
+//   3. 如果 popup 关闭，postToPopup 静默丢弃，不会阻塞 native host 推送
 function downloadUrlNativeWithProgress(dir, items, sendResponse) {
   try {
     const port = chrome.runtime.connectNative('com.doubao.remove.mark');
@@ -398,8 +439,8 @@ function downloadUrlNativeWithProgress(dir, items, sendResponse) {
     port.onMessage.addListener((msg) => {
       if (msg.type === 'download_progress') {
         // 每完成一张图片，native host 推送进度消息
-        // 转发给 popup 实时刷新进度显示
-        chrome.runtime.sendMessage({
+        // 通过 popup Port 直接转发，最低延迟
+        postToPopup({
           type: 'DOWNLOAD_PROGRESS_UPDATE',
           completed: msg.completed,
           total: msg.total,
@@ -408,27 +449,30 @@ function downloadUrlNativeWithProgress(dir, items, sendResponse) {
           filename: msg.filename,
           itemSuccess: msg.item_success,
           itemError: msg.item_error,
-        }).catch(() => {
-          // popup 可能已关闭，忽略发送失败
         });
       } else if (msg.type === 'download_complete') {
         // 全部下载完成
         downloadFinished = true;
-        chrome.runtime.sendMessage({
+        const completeMsg = {
           type: 'DOWNLOAD_COMPLETE',
           successCount: msg.success_count,
           failCount: msg.fail_count,
           results: msg.results,
-        }).catch(() => {});
+        };
+        // 优先走 Port 推送；如果当前没有活跃 popup（popup 已关闭），则缓存供下次重连补发
+        const delivered = postToPopup(completeMsg);
+        if (!delivered) {
+          lastCompleteSnapshot = completeMsg;
+        }
         // 长连接任务完成，断开连接
         port.disconnect();
       } else if (msg.success === false && msg.error) {
         // 错误消息（如目录不存在等）
         downloadFinished = true;
-        chrome.runtime.sendMessage({
+        postToPopup({
           type: 'DOWNLOAD_ERROR',
           error: msg.error,
-        }).catch(() => {});
+        });
         port.disconnect();
       }
     });
@@ -441,10 +485,10 @@ function downloadUrlNativeWithProgress(dir, items, sendResponse) {
         return;
       }
       if (err) {
-        chrome.runtime.sendMessage({
+        postToPopup({
           type: 'DOWNLOAD_ERROR',
           error: err.message,
-        }).catch(() => {});
+        });
       }
     });
 

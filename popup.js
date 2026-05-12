@@ -459,13 +459,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
-  // ── 下载进度回调：监听 background.js 转发的进度更新 ──
-  // native_host.py 每完成一张图片就通过 connectNative 长连接推送 download_progress
-  // background.js 转发为 DOWNLOAD_PROGRESS_UPDATE 消息，popup 实时刷新 UI
+  // ── 下载进度回调：监听 background.js 通过 Port 转发的进度更新 ──
+  // native_host.py 文件落盘后立即在 worker 线程里 send_message
+  // → background.js 收到后 postMessage 到本 Port
+  // → popup 监听 onMessage 实时刷新 UI
+  // 用 Port 长连接而非 sendMessage，可消除消息注册/查找开销，进度更跟手
   let downloadTotal = 0;
   let downloadTargetDir = '';
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const progressPort = chrome.runtime.connect({ name: 'download-progress' });
+  progressPort.onMessage.addListener((message) => {
     if (message.type === 'DOWNLOAD_PROGRESS_UPDATE') {
       // 收到进度回调：native host 完成了一张图片
       const completed = message.completed;
@@ -489,7 +492,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       $downloadBtn.disabled = false;
       $downloadBtn.textContent = '下载选中';
 
-      const s = chrome.storage.local.get(['downloadDirFullPath'], (stored) => {
+      chrome.storage.local.get(['downloadDirFullPath'], (stored) => {
         const targetDir = stored.downloadDirFullPath || '';
         if (failCount > 0 && successCount === 0) {
           showPopupToast(`❌ 下载失败 ${failCount} 张，请确认 native host 已就绪`, 'error');

@@ -157,16 +157,52 @@ def handle_message(message):
         progress_success = 0
         progress_fail = 0
 
+        def push_progress(result):
+            """文件落盘后立即在子线程内推送进度消息（send_message 已加锁，线程安全）"""
+            nonlocal progress_completed, progress_success, progress_fail
+            with progress_lock:
+                progress_completed += 1
+                if result.get('success'):
+                    progress_success += 1
+                else:
+                    progress_fail += 1
+                completed = progress_completed
+                success = progress_success
+                fail = progress_fail
+
+            # 直接在 worker 线程内推送：文件落盘 → 进度上报 几乎零延迟
+            send_message({
+                'type': 'download_progress',
+                'completed': completed,
+                'total': total_count,
+                'success': success,
+                'fail': fail,
+                'filename': result.get('filename', ''),
+                'item_success': result.get('success', False),
+                'item_error': result.get('error', None),
+            })
+
         def download_one_item(idx, item):
-            """下载单个文件，返回结果 dict"""
+            """下载单个文件，返回结果 dict；落盘后立即推送进度（不等主线程收集）"""
             filename = item.get('filename', '')
             url = item.get('url', '')
+
+            def _finish(result):
+                """统一在子线程内：先推送进度，再返回结果"""
+                result['index'] = idx
+                try:
+                    push_progress(result)
+                except Exception:
+                    # 推送失败不影响下载结果（例如 stdout 已关闭）
+                    pass
+                return result
+
             if not filename or not url:
-                return {'filename': filename, 'success': False, 'error': 'Missing filename or url'}
+                return _finish({'filename': filename, 'success': False, 'error': 'Missing filename or url'})
 
             # 安全：filename 不能包含路径分隔符
             if '/' in filename or '\\' in filename or filename.startswith('.'):
-                return {'filename': filename, 'success': False, 'error': f'Invalid filename: {filename}'}
+                return _finish({'filename': filename, 'success': False, 'error': f'Invalid filename: {filename}'})
 
             full_path = os.path.join(target_dir, filename)
             # 处理重名
@@ -195,40 +231,17 @@ def handle_message(message):
                             f.write(chunk)
                             total_read += len(chunk)
                 file_size = os.path.getsize(full_path)
-                return {'filename': filename, 'success': True, 'path': full_path, 'bytes': file_size}
+                return _finish({'filename': filename, 'success': True, 'path': full_path, 'bytes': file_size})
             except urllib.error.URLError as ue:
-                return {'filename': filename, 'success': False, 'error': f'URLError: {ue.reason}'}
+                return _finish({'filename': filename, 'success': False, 'error': f'URLError: {ue.reason}'})
             except urllib.error.HTTPError as he:
-                return {'filename': filename, 'success': False, 'error': f'HTTP {he.code}: {he.reason}'}
+                return _finish({'filename': filename, 'success': False, 'error': f'HTTP {he.code}: {he.reason}'})
             except Exception as e:
-                return {'filename': filename, 'success': False, 'error': str(e)}
-
-        def on_item_complete(idx, item, result):
-            """每完成一个下载就回调推送进度消息"""
-            nonlocal progress_completed, progress_success, progress_fail
-            with progress_lock:
-                progress_completed += 1
-                if result.get('success'):
-                    progress_success += 1
-                else:
-                    progress_fail += 1
-                completed = progress_completed
-                success = progress_success
-                fail = progress_fail
-
-            # 回调推送进度消息
-            send_message({
-                'type': 'download_progress',
-                'completed': completed,
-                'total': total_count,
-                'success': success,
-                'fail': fail,
-                'filename': result.get('filename', ''),
-                'item_success': result.get('success', False),
-                'item_error': result.get('error', None),
-            })
+                return _finish({'filename': filename, 'success': False, 'error': str(e)})
 
         # 使用 ThreadPoolExecutor 并行下载
+        # 注意：进度推送已经在 download_one_item 内部完成（A 方案），
+        # 主循环这里只负责收集最终结果用于 download_complete 消息。
         results = []
         with ThreadPoolExecutor(max_workers=min(8, total_count)) as executor:
             future_to_item = {}
@@ -240,13 +253,15 @@ def handle_message(message):
                 idx, item = future_to_item[future]
                 try:
                     result = future.result()
-                    result['index'] = idx
                 except Exception as e:
                     filename = item.get('filename', '')
+                    # 兜底：worker 线程异常导致没机会调用 push_progress，这里补推一次
                     result = {'filename': filename, 'success': False, 'error': str(e), 'index': idx}
-
+                    try:
+                        push_progress(result)
+                    except Exception:
+                        pass
                 results.append(result)
-                on_item_complete(idx, item, result)
 
         # 按原始索引排序结果
         results.sort(key=lambda r: r.get('index', 0))
